@@ -155,3 +155,5 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [jobharness](https://github.com/uhsear/jobharness) - the harness the maintenance script itself should run under
+- [svcsource](https://github.com/uhsear/svcsource) - what each of those services actually points at
+- [prostall](https://github.com/uhsear/prostall) - why the workstation talking to them is slow
