@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""svcguard: run a maintenance command against a stopped ArcGIS Server service and
-guarantee the service is started again afterwards, even when the command fails.
+"""svcguard: run a maintenance command against stopped ArcGIS Server services and
+guarantee every service is started again afterwards, even when the command fails.
 
-Stdlib only. Python 3.8+.
+SEVERAL SERVICES
+    Repeat --service. The services stop in the order given and start in reverse.
+    The stop phase halts at the first service that does not confirm STOPPED, and
+    the command runs only when every service confirmed STOPPED. Every service the
+    stop phase reached is then started, each with its own fresh token, and one
+    failed start never skips the starts after it.
+
+Stdlib only. Python 3.9+.
 
 CONFIG PRECEDENCE (identical to the README):
     user      --user           >  env ARCGIS_SERVER_USER      >  interactive getpass prompt
@@ -11,10 +18,10 @@ CONFIG PRECEDENCE (identical to the README):
 The password is never accepted as a flag, never logged, and never written to disk.
 
 EXIT CODES
-    0   service stopped, command succeeded, service started
-    1   service never reached STOPPED so the command was REFUSED; restart succeeded
-    2   command failed (non-zero or raised); restart succeeded
-    3   the service could not be started again. A human needs to look now
+    0   every service stopped, command succeeded, every service started
+    1   a service never reached STOPPED so the command was REFUSED; restarts succeeded
+    2   command failed (non-zero or raised); restarts succeeded
+    3   at least one service could not be started again. A human needs to look now
    64   usage error
 """
 
@@ -33,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ==========================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -315,25 +322,70 @@ def _run_command(command):
 # orchestration
 # --------------------------------------------------------------------------
 
-def guard(server_url, service, command, username, password, insecure, retries, timeout):
-    """stop -> command -> ALWAYS start. Returns an exit code."""
-    stopped = False
+def restart_order(services, reached):
+    """The services to start again, in start order. Pure.
+
+    reached is the index of the last service the stop phase worked on. The stop
+    phase halts at its first failure, so the services after it were never touched
+    and are left exactly as they were. The one it failed on is started too: a stop
+    that timed out can leave a service half down.
+    """
+    return list(reversed(services[:reached + 1]))
+
+
+def exit_code(all_stopped, command_rc, failed_starts):
+    """Combine the three phase results into one exit code. Pure."""
+    if failed_starts:
+        return 3
+    if not all_stopped:
+        return 1
+    if command_rc != 0:
+        return 2
+    return 0
+
+
+def _start_one(server_url, service, username, password, insecure, retries, timeout):
+    """Start one service. Never raises, so one failed start cannot skip the next.
+
+    Each start gets a FRESH token: the stop-phase token may have expired during a
+    long command, it may never have existed if the stop phase's own token call
+    threw, and a token failure here must cost this service only.
+    """
+    try:
+        log.info("Requesting FRESH token to start %s ...", service)
+        token = get_token(server_url, username, password, insecure, retries)
+        log.info("Starting %s ...", service)
+        manage_service(server_url, service, token, "start", insecure, retries)
+        wait_for_state(server_url, service, token, "STARTED", insecure, retries, timeout)
+        log.info("%s is STARTED.", service)
+        return True
+    except Exception as exc:
+        log.critical("RESTART FAILED, %s may be down: %s", service, exc)
+        return False
+
+
+def guard(server_url, services, command, username, password, insecure, retries, timeout):
+    """stop each -> command -> ALWAYS start each, independently. Returns an exit code."""
+    reached = 0
+    all_stopped = False
     command_rc = None
-    restart_ok = False
+    failed = []
 
     try:
         try:
             log.info("Requesting token for stop phase...")
             token = get_token(server_url, username, password, insecure, retries)
-            log.info("Stopping %s ...", service)
-            manage_service(server_url, service, token, "stop", insecure, retries)
-            wait_for_state(server_url, service, token, "STOPPED", insecure, retries, timeout)
-            stopped = True
-            log.info("Service is STOPPED.")
+            for reached, service in enumerate(services):
+                log.info("Stopping %s ...", service)
+                manage_service(server_url, service, token, "stop", insecure, retries)
+                wait_for_state(server_url, service, token, "STOPPED", insecure, retries,
+                               timeout)
+                log.info("%s is STOPPED.", service)
+            all_stopped = True
         except Exception as exc:
-            log.error("Stop phase failed: %s", exc)
+            log.error("Stop phase failed at %s: %s", services[reached], exc)
 
-        if stopped:
+        if all_stopped:
             try:
                 command_rc = _run_command(command)
             except Exception as exc:
@@ -341,30 +393,19 @@ def guard(server_url, service, command, username, password, insecure, retries, t
                 command_rc = -1
         else:
             log.error(
-                "REFUSING to run the maintenance command: the service is not confirmed "
+                "REFUSING to run the maintenance command: not every service is confirmed "
                 "STOPPED. Running it now would operate on live, in-use data."
             )
     finally:
-        # Fresh token: the stop-phase token may have expired during a long command,
-        # and it may never have existed if the stop phase's own token call threw.
-        try:
-            log.info("Requesting FRESH token for restart phase...")
-            token = get_token(server_url, username, password, insecure, retries)
-            log.info("Starting %s ...", service)
-            manage_service(server_url, service, token, "start", insecure, retries)
-            wait_for_state(server_url, service, token, "STARTED", insecure, retries, timeout)
-            restart_ok = True
-            log.info("Service is STARTED.")
-        except Exception as exc:
-            log.critical("RESTART FAILED, service may be down: %s", exc)
+        for service in restart_order(services, reached):
+            if not _start_one(server_url, service, username, password, insecure, retries,
+                              timeout):
+                failed.append(service)
+        if failed:
+            log.critical("%d of %d service(s) are NOT running: %s",
+                         len(failed), reached + 1, ", ".join(failed))
 
-    if not restart_ok:
-        return 3
-    if not stopped:
-        return 1
-    if command_rc != 0:
-        return 2
-    return 0
+    return exit_code(all_stopped, command_rc, failed)
 
 
 # --------------------------------------------------------------------------
@@ -374,14 +415,16 @@ def guard(server_url, service, command, username, password, insecure, retries, t
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="svcguard",
-        description="Guarantee an ArcGIS Server service restarts around risky maintenance, "
+        description="Guarantee ArcGIS Server services restart around risky maintenance, "
                     "even on failure.",
         epilog="Password: env ARCGIS_SERVER_PASSWORD, else prompt. There is no --password flag.",
         allow_abbrev=False,
     )
     parser.add_argument("--server-url",
                         help="AGS admin REST base, e.g. https://gis.example.org/server")
-    parser.add_argument("--service", help="NAME.TYPE, e.g. Parcels_Locator.GeocodeServer")
+    parser.add_argument("--service", action="append",
+                        help="NAME.TYPE, e.g. Parcels_Locator.GeocodeServer. Repeat for "
+                             "several: they stop in the order given and start in reverse")
     parser.add_argument("--command", help="maintenance command run while the service is stopped")
     parser.add_argument("--apply", action="store_true",
                         help="actually talk to the server; without it, zero HTTP calls happen")
@@ -427,8 +470,13 @@ def main(argv=None):
         sys.stderr.write("error: missing required option(s): %s\n"
                          % ", ".join("--" + m.replace("_", "-") for m in missing))
         return 64
-    if "." not in args.service:
+    services = args.service
+    if [name for name in services if "." not in name]:
         sys.stderr.write("error: --service must be NAME.TYPE, e.g. Parcels_Locator.GeocodeServer\n")
+        return 64
+    repeated = sorted(set(name for name in services if services.count(name) > 1))
+    if repeated:
+        sys.stderr.write("error: --service given more than once: %s\n" % ", ".join(repeated))
         return 64
     if args.retries < 1 or args.timeout < 1:
         sys.stderr.write("error: --retries and --timeout must be >= 1\n")
@@ -437,8 +485,11 @@ def main(argv=None):
     if not args.apply:
         print("DRY RUN. No HTTP call was made. Re-run with --apply to execute.")
         print("  server   : %s" % args.server_url)
-        print("  service  : %s" % args.service)
-        print("  would    : stop -> run %r -> start (start guaranteed via finally)" % args.command)
+        print("  stop     : %s (halts at the first that does not confirm STOPPED)"
+              % " -> ".join(services))
+        print("  run      : %r, only if every service confirmed STOPPED" % args.command)
+        print("  start    : %s (each with a fresh token; a failed start skips no other)"
+              % " -> ".join(restart_order(services, len(services) - 1)))
         print("  tls      : %s" % ("VERIFICATION DISABLED (--insecure)" if args.insecure
                                    else "verified"))
         print("  timeout  : %ss   retries: %s   poll: %ss" % (args.timeout, args.retries,
@@ -453,11 +504,12 @@ def main(argv=None):
 
     log_path = _setup_logging(LOG_DIR)
     log.info("=" * 60)
-    log.info("svcguard %s starting | service=%s | log=%s", __version__, args.service, log_path)
+    log.info("svcguard %s starting | services=%s | log=%s", __version__, ", ".join(services),
+             log_path)
     if args.insecure:
         log.warning("TLS verification is DISABLED for this run (--insecure).")
     try:
-        code = guard(args.server_url, args.service, args.command, username, password,
+        code = guard(args.server_url, services, args.command, username, password,
                      args.insecure, args.retries, args.timeout)
     finally:
         log.info("svcguard finished. Log: %s", log_path)
@@ -466,7 +518,7 @@ def main(argv=None):
 
 
 # ==========================================================================
-# SELF-TEST. No sockets, no credentials, no arcpy. urllib is never reached.
+# SELF-TEST. No credentials, no arcpy, no network beyond a loopback stub on 127.0.0.1.
 # ==========================================================================
 
 class _Checker(object):
@@ -549,6 +601,91 @@ def _quiet(func, *args):
     return result, out.getvalue(), err.getvalue()
 
 
+def _raises(check, fn, exc_type, label, text=None):
+    """Record one assertion: fn() raises exc_type, and its message passes text.
+
+    text is a substring or a predicate on the message. Returns the exception, or
+    None when the assertion failed.
+    """
+    try:
+        fn()
+    except exc_type as exc:
+        message = str(exc)
+        ok = text is None or (text(message) if callable(text) else text in message)
+        check(ok, label)
+        return exc
+    except Exception as exc:
+        check(False, "%s (wrong exception %r)" % (label, exc))
+        return None
+    check(False, "%s (no error raised)" % label)
+    return None
+
+
+class _StubAdmin(object):
+    """A loopback http.server that plays the admin API, so the real urllib path runs.
+
+    It keeps one realTimeState per service and logs every (operation, service) in
+    arrival order. A service in fail_start answers its start with the documented
+    error body; a service in never_stops accepts a stop and stays STARTED.
+    """
+
+    TOKEN = "STUB-TOKEN-q7w8e9"
+
+    def __init__(self, services, fail_start=(), never_stops=()):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        self.state = dict((name, "STARTED") for name in services)
+        self.fail_start = set(fail_start)
+        self.never_stops = set(never_stops)
+        self.ops = []
+        self.forms = []
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length"))
+                form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+                stub.forms.append(form)
+                reply = stub.answer(self.path)
+                raw = (reply if isinstance(reply, str) else json.dumps(reply)).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *_args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d/x" % self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def answer(self, path):
+        if path.endswith("/admin/generateToken"):
+            return {"token": self.TOKEN, "expires": 1}
+        if path.endswith("/proxy"):
+            return "<html>proxy sign-in page</html>"
+        service, op = path.split("/")[-2:]
+        self.ops.append((op, service))
+        if op == "status":
+            return {"configuredState": self.state[service], "realTimeState": self.state[service]}
+        if op == "start" and service in self.fail_start:
+            # The documented shape of a start the server refuses.
+            return {"status": "error", "code": 500, "messages": ["cannot start"]}
+        if op == "start":
+            self.state[service] = "STARTED"
+        elif service not in self.never_stops:
+            self.state[service] = "STOPPED"
+        return {"status": "success"}
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
 def self_test():
     module = sys.modules[__name__]
     check = _Checker()
@@ -568,6 +705,9 @@ def self_test():
         module._sleep = clock.sleep
         return clock
 
+    def raises(fn, exc_type, label, text=None):
+        return _raises(check, fn, exc_type, label, text)
+
     def run_guard(fake, run=None, retries=3, timeout=120, clock=None):
         """Run guard() with counted get_token; returns (exit_code, token_call_count)."""
         counter = [0]
@@ -579,7 +719,7 @@ def self_test():
         install(http=fake, run=run, clock=clock)
         module.get_token = counting
         try:
-            code = guard("https://s.example.org/x", "Svc.MapServer", "noop",
+            code = guard("https://s.example.org/x", ["Svc.MapServer"], "noop",
                          "u", "p", False, retries, timeout)
         finally:
             module.get_token = real_token
@@ -600,34 +740,19 @@ def self_test():
               "_check_ags accepts a success body")
         check(_check_ags({"realTimeState": "STOPPED"}, "w")["realTimeState"] == "STOPPED",
               "_check_ags accepts a status body with no 'status' key")
-        try:
-            _check_ags({"status": "failed", "messages": ["nope"]}, "stop")
-            check(False, "HTTP 200 + status=failed is a failure")
-        except SvcGuardError as exc:
-            check("status=failed" in str(exc), "HTTP 200 + status=failed is a failure")
-            check("stop" in str(exc), "failure message names the operation")
-        try:
-            _check_ags({"error": {"code": 498, "message": "Invalid token"}}, "status")
-            check(False, "HTTP 200 + error{code:498} is a failure")
-        except SvcGuardError as exc:
-            check("498" in str(exc), "HTTP 200 + error{code:498} is a failure")
-        try:
-            # AGS's real word for a failed admin operation is "error", not "failed".
-            _check_ags({"status": "error", "messages": ["boom"]}, "start")
-            check(False, "HTTP 200 + status=error is a failure  <-- pinned defect")
-        except SvcGuardError as exc:
-            check("status=error" in str(exc),
-                  "HTTP 200 + status=error is a failure  <-- pinned defect")
-        try:
-            _check_ags({"status": "whoKnows"}, "w")
-            check(False, "_check_ags whitelists success (any other status is a failure)")
-        except SvcGuardError:
-            check(True, "_check_ags whitelists success (any other status is a failure)")
-        try:
-            _check_ags("<html>proxy</html>", "w")
-            check(False, "_check_ags rejects a non-dict body")
-        except SvcGuardError:
-            check(True, "_check_ags rejects a non-dict body")
+        exc = raises(lambda: _check_ags({"status": "failed", "messages": ["nope"]}, "stop"),
+                     SvcGuardError, "HTTP 200 + status=failed is a failure", "status=failed")
+        check("stop" in str(exc), "failure message names the operation")
+        raises(lambda: _check_ags({"error": {"code": 498, "message": "Invalid token"}}, "status"),
+               SvcGuardError, "HTTP 200 + error{code:498} is a failure", "498")
+        # AGS's real word for a failed admin operation is "error", not "failed".
+        raises(lambda: _check_ags({"status": "error", "messages": ["boom"]}, "start"),
+               SvcGuardError, "HTTP 200 + status=error is a failure  <-- pinned defect",
+               "status=error")
+        raises(lambda: _check_ags({"status": "whoKnows"}, "w"), SvcGuardError,
+               "_check_ags whitelists success (any other status is a failure)")
+        raises(lambda: _check_ags("<html>proxy</html>", "w"), SvcGuardError,
+               "_check_ags rejects a non-dict body")
 
         check(_ssl_context(True).verify_mode == ssl.CERT_NONE,
               "--insecure yields CERT_NONE")
@@ -663,11 +788,8 @@ def self_test():
             raise TransientError("boom")
 
         install(http=always_fail)
-        try:
-            _request("u", {}, False, 3, "doomed")
-            check(False, "retry raises when attempts are exhausted")
-        except SvcGuardError as exc:
-            check("after 3 attempt" in str(exc), "retry raises when attempts are exhausted")
+        raises(lambda: _request("u", {}, False, 3, "doomed"), SvcGuardError,
+               "retry raises when attempts are exhausted", "after 3 attempt")
         check(calls[0] == 3, "exhausted retry stopped at --retries attempts")
 
         calls[0] = 0
@@ -677,11 +799,8 @@ def self_test():
             return {"status": "failed", "messages": ["denied"]}
 
         install(http=refused)
-        try:
-            _request("u", {}, False, 3, "refused")
-            check(False, "a server refusal raises")
-        except SvcGuardError:
-            check(True, "a server refusal raises")
+        raises(lambda: _request("u", {}, False, 3, "refused"), SvcGuardError,
+               "a server refusal raises")
         check(calls[0] == 1, "a server refusal is NOT retried")
 
         # HTTP-status classification, exercised through the real _http_json by
@@ -700,24 +819,19 @@ def self_test():
                 opened[0] = 0
                 urllib.request.urlopen = _raise_http(code)
                 install()  # restore the real _http_json under the fake urlopen
-                try:
-                    _request("https://s.example.org/x", {}, False, 3, "perm")
-                    check(False, "HTTP %d is not retried  <-- pinned defect" % code)
-                except SvcGuardError as exc:
-                    check("not retryable" in str(exc) and "attempt" not in str(exc),
-                          "HTTP %d is a refusal, not a transient  <-- pinned defect" % code)
+                raises(lambda: _request("https://s.example.org/x", {}, False, 3, "perm"),
+                       SvcGuardError,
+                       "HTTP %d is a refusal, not a transient  <-- pinned defect" % code,
+                       lambda msg: "not retryable" in msg and "attempt" not in msg)
                 check(opened[0] == 1, "HTTP %d made exactly 1 request" % code)
 
             for code in (429, 500, 503):
                 opened[0] = 0
                 urllib.request.urlopen = _raise_http(code)
                 install()
-                try:
-                    _request("https://s.example.org/x", {}, False, 3, "temp")
-                    check(False, "HTTP %d is retried as transient" % code)
-                except SvcGuardError as exc:
-                    check("after 3 attempt" in str(exc),
-                          "HTTP %d is retried as transient" % code)
+                raises(lambda: _request("https://s.example.org/x", {}, False, 3, "temp"),
+                       SvcGuardError, "HTTP %d is retried as transient" % code,
+                       "after 3 attempt")
                 check(opened[0] == 3, "HTTP %d used all 3 attempts" % code)
         finally:
             urllib.request.urlopen = real_urlopen
@@ -731,29 +845,20 @@ def self_test():
 
         fake = _FakeServer(states=["STARTED"])
         install(http=fake)
-        try:
-            wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 3, 20)
-            check(False, "wait_for_state raises StateTimeout when the state never changes")
-        except StateTimeout as exc:
-            check("STOPPED" in str(exc),
-                  "wait_for_state raises StateTimeout when the state never changes")
+        raises(lambda: wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 3, 20),
+               StateTimeout, "wait_for_state raises StateTimeout when the state never changes",
+               "STOPPED")
         check(fake.count("/status") >= 2, "the timeout path polled more than once")
 
         fake = _FakeServer(status_body={"error": {"code": 498, "message": "expired"}})
         install(http=fake)
-        try:
-            wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 1, 10)
-            check(False, "a 498 during polling does not count as reaching the state")
-        except StateTimeout:
-            check(True, "a 498 during polling does not count as reaching the state")
+        raises(lambda: wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 1, 10),
+               StateTimeout, "a 498 during polling does not count as reaching the state")
 
         fake = _FakeServer(states=["UNKNOWN"])
         install(http=fake)
-        try:
-            wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 1, 10)
-            check(False, "UNKNOWN is not treated as STOPPED")
-        except StateTimeout:
-            check(True, "UNKNOWN is not treated as STOPPED")
+        raises(lambda: wait_for_state("b", "S.MapServer", "t", "STOPPED", False, 1, 10),
+               StateTimeout, "UNKNOWN is not treated as STOPPED")
 
         # ---- group D: happy path ----------------------------------------
         ran = []
@@ -844,11 +949,8 @@ def self_test():
         code, out, err = _quiet(main, ["--server-url", "u", "--service", "NoDot",
                                        "--command", "c"])
         check(code == 64, "--service must be NAME.TYPE")
-        try:
-            _quiet(build_parser().parse_args, ["--ap"])
-            check(False, "a unique prefix of --apply is refused by the parser  <-- pinned defect")
-        except SystemExit:
-            check(True, "a unique prefix of --apply is refused by the parser  <-- pinned defect")
+        raises(lambda: _quiet(build_parser().parse_args, ["--ap"]), SystemExit,
+               "a unique prefix of --apply is refused by the parser  <-- pinned defect")
         check(build_parser().parse_args([]).apply is False, "--apply defaults to OFF")
         check(build_parser().parse_args([]).insecure is False, "--insecure defaults to OFF")
         check(build_parser().parse_args([]).timeout == 120, "--timeout defaults to 120")
@@ -894,6 +996,271 @@ def self_test():
         finally:
             _close_logging()
             shutil.rmtree(tmp, ignore_errors=True)
+
+        # From here on, more than one service. A loopback http.server plays the
+        # admin API, so these runs go through the real urllib path, not a fake.
+        def hush():
+            _close_logging()
+            log.addHandler(logging.NullHandler())
+            log.setLevel(logging.CRITICAL)
+
+        def ops(stub, op):
+            return [name for (seen, name) in stub.ops if seen == op]
+
+        def tokens(stub):
+            return len([form for form in stub.forms if "username" in form])
+
+        hush()
+        work = tempfile.mkdtemp(prefix="svcguard-selftest-")
+        saved_env = dict(os.environ)
+        real_log_dir = LOG_DIR
+        real_getpass = getpass.getpass
+        try:
+            # ---- group L: the pure decision core ------------------------
+            three = ["A.MapServer", "B.GeocodeServer", "C.FeatureServer"]
+            check(restart_order(three, 2) == ["C.FeatureServer", "B.GeocodeServer",
+                                              "A.MapServer"],
+                  "every service the stop phase reached starts again, in reverse order")
+            check(restart_order(three, 1) == ["B.GeocodeServer", "A.MapServer"],
+                  "a stop phase that failed on the second service restarts the first two")
+            check(restart_order(three, 0) == ["A.MapServer"],
+                  "a stop phase that failed on the first service restarts that one only")
+            check(restart_order(["A.MapServer"], 0) == ["A.MapServer"],
+                  "one service restarts that service, as before")
+            check(exit_code(True, 0, []) == 0, "all stopped, command 0, all started is exit 0")
+            check(exit_code(True, 0, ["B.GeocodeServer"]) == 3,
+                  "one failed start is exit 3 even when everything else worked")
+            check(exit_code(False, None, ["B.GeocodeServer"]) == 3,
+                  "a failed start outranks a refused command")
+            check(exit_code(True, 7, ["B.GeocodeServer"]) == 3,
+                  "a failed start outranks a failed command")
+            check(exit_code(False, None, []) == 1, "a refused command with all started is exit 1")
+            check(exit_code(True, 7, []) == 2, "a failed command with all started is exit 2")
+            check(exit_code(True, -1, []) == 2, "a command that could not run is exit 2")
+
+            # ---- group M: one failed start skips no other ---------------
+            ran = []
+            stub = _StubAdmin(three, fail_start=["B.GeocodeServer"])
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 3, "a failed start of the middle service exits 3")
+            check(stub.state["A.MapServer"] == "STARTED",
+                  "the service started AFTER the failed one is running again  <-- pinned defect")
+            check(stub.state["C.FeatureServer"] == "STARTED",
+                  "the service started before the failed one is running again")
+            check(stub.state["B.GeocodeServer"] == "STOPPED",
+                  "the failed service is reported, not imagined running")
+            check(ops(stub, "start") == ["C.FeatureServer", "B.GeocodeServer", "A.MapServer"],
+                  "starts run in reverse stop order and the failed one was still attempted")
+            check(ops(stub, "stop") == three, "stops ran in the order given")
+            check(ran == ["noop"], "the command ran once, after every service confirmed STOPPED")
+            check(tokens(stub) == 4, "one stop token plus one fresh token per start")
+            check(all(form.get("token") == [_StubAdmin.TOKEN] for form in stub.forms
+                      if "username" not in form),
+                  "every admin request carried the token in its POST body")
+
+            # ---- group N: a stop that never lands halts the stop phase --
+            ran = []
+            stub = _StubAdmin(three, never_stops=["B.GeocodeServer"])
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 10)
+            finally:
+                stub.close()
+            check(ran == [], "the command never runs when one of three never confirms STOPPED"
+                  "  <-- pinned defect")
+            check(code == 1, "and the run exits 1, refused, with every start good")
+            check("C.FeatureServer" not in [name for (_op, name) in stub.ops],
+                  "the stop phase halts at the failure: the third service is never touched"
+                  "  <-- pinned defect")
+            check(ops(stub, "start") == ["B.GeocodeServer", "A.MapServer"],
+                  "the services the stop phase reached are started again, newest first")
+            check(stub.state["A.MapServer"] == "STARTED"
+                  and stub.state["C.FeatureServer"] == "STARTED",
+                  "every service ends the run started")
+
+            # ---- group O: a token failure costs one start only ----------
+            token_calls = [0]
+
+            def third_token_fails(url, data, insecure=False, http_timeout=None):
+                if url.endswith("/generateToken"):
+                    token_calls[0] += 1
+                    if token_calls[0] == 3:
+                        raise TransientError("simulated connection reset")
+                return real_http(url, data, insecure, http_timeout)
+
+            stub = _StubAdmin(three)
+            try:
+                install(http=third_token_fails, run=lambda cmd: 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 1, 20)
+            finally:
+                stub.close()
+            check(code == 3, "a token failure while starting one service exits 3")
+            check(ops(stub, "start") == ["C.FeatureServer", "A.MapServer"],
+                  "the start after the token failure still happened  <-- pinned defect")
+            check(stub.state["B.GeocodeServer"] == "STOPPED"
+                  and stub.state["A.MapServer"] == "STARTED",
+                  "only the service whose token failed is left down")
+
+            stub = _StubAdmin(["A.MapServer"])
+            try:
+                install(run=lambda cmd: 0)
+                code = guard(stub.url, ["A.MapServer"], "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 0 and stub.ops == [("stop", "A.MapServer"), ("status", "A.MapServer"),
+                                             ("start", "A.MapServer"), ("status", "A.MapServer")],
+                  "one --service still runs stop, poll, start, poll and nothing else")
+
+            # ---- group P: the CLI end to end over real HTTP -------------
+            marker = os.path.join(work, "command-ran")
+            make_marker = '"%s" -c "open(r\'%s\', \'w\').close()"' % (sys.executable, marker)
+            exit_five = '"%s" -c "import sys; sys.exit(5)"' % sys.executable
+            os.environ["ARCGIS_SERVER_USER"] = "stub-admin"
+            os.environ["ARCGIS_SERVER_PASSWORD"] = "stub-pass-n3m4"
+            os.environ["no_proxy"] = "127.0.0.1"
+            module.LOG_DIR = os.path.join(work, "logs-a")
+            stub = _StubAdmin(three, fail_start=["B.GeocodeServer"])
+            argv = ["--server-url", stub.url, "--command", make_marker, "--apply", "--insecure",
+                    "--timeout", "20"]
+            for name in three:
+                argv += ["--service", name]
+            try:
+                install()
+                code, out, err = _quiet(main, argv)
+            finally:
+                stub.close()
+                hush()
+            check(code == 3, "main exits 3 when one of three starts fails")
+            check(os.path.exists(marker), "the real maintenance command ran through the shell")
+            check(stub.state["A.MapServer"] == "STARTED"
+                  and stub.state["C.FeatureServer"] == "STARTED",
+                  "and the other two services are running again")
+            check("RESTART FAILED, B.GeocodeServer" in err, "stderr names the failed start")
+            logs = glob.glob(os.path.join(module.LOG_DIR, "svcguard_*.log"))
+            with open(logs[0], "r", encoding="utf-8") as handle:
+                contents = handle.read()
+            check("1 of 3 service(s) are NOT running: B.GeocodeServer" in contents,
+                  "the log ends with the one service still down, out of how many")
+            check(_StubAdmin.TOKEN not in contents and "stub-pass-n3m4" not in contents,
+                  "neither the token nor the password reaches the log file")
+            check("TLS verification is DISABLED" in contents, "the log records --insecure")
+
+            module.LOG_DIR = os.path.join(work, "logs-b")
+            stub = _StubAdmin(three[:2])
+            try:
+                install()
+                code, out, err = _quiet(main, ["--server-url", stub.url, "--command", exit_five,
+                                               "--service", three[0], "--service", three[1],
+                                               "--apply"])
+            finally:
+                stub.close()
+                hush()
+            check(code == 2, "a real command that exits 5 gives exit 2")
+            check(sorted(stub.state.values()) == ["STARTED", "STARTED"],
+                  "and both services are started again")
+            check("TLS verification is DISABLED" not in err, "without --insecure, no TLS warning")
+
+            # ---- group Q: CLI validation for several services -----------
+            install(http=_explode, run=_explode)
+            check(build_parser().parse_args(["--service", "B.MapServer", "--service",
+                                             "A.MapServer"]).service
+                  == ["B.MapServer", "A.MapServer"],
+                  "--service repeats and keeps the order given")
+            code, out, err = _quiet(main, ["--server-url", "u", "--command", "c",
+                                           "--service", "A.MapServer", "--service", "B.MapServer"])
+            check(code == 0 and "stop     : A.MapServer -> B.MapServer" in out,
+                  "the dry run prints the stop order and makes zero HTTP calls")
+            check("start    : B.MapServer -> A.MapServer" in out,
+                  "the dry run prints the start order, reversed")
+            code, out, err = _quiet(main, ["--server-url", "u", "--command", "c",
+                                           "--service", "A.MapServer", "--service", "A.MapServer"])
+            check(code == 64 and "more than once: A.MapServer" in err,
+                  "a service named twice is a usage error")
+            code, out, err = _quiet(main, ["--server-url", "u", "--command", "c",
+                                           "--service", "A.MapServer", "--service", "NoDot"])
+            check(code == 64, "every --service must be NAME.TYPE, not only the first")
+            code, out, err = _quiet(main, ["--server-url", "u", "--command", "c",
+                                           "--service", "A.MapServer", "--retries", "0"])
+            check(code == 64, "--retries 0 is a usage error")
+            raises(lambda: _quiet(build_parser().parse_args, ["--appl"]), SystemExit,
+                   "the longest prefix --appl of --apply is refused too  <-- pinned defect")
+            del os.environ["ARCGIS_SERVER_USER"]
+            module.input = lambda prompt: "   "
+            try:
+                code, out, err = _quiet(main, ["--server-url", "u", "--command", "c",
+                                               "--service", "A.MapServer", "--apply"])
+            finally:
+                del module.input
+            check(code == 64 and "username and password are required" in err,
+                  "--apply with a blank typed user is a usage error, before any HTTP")
+
+            # ---- group R: credentials, transport and helper edges -------
+            check(_resolve_user("flag-user") == "flag-user", "--user wins over everything")
+            os.environ["ARCGIS_SERVER_USER"] = "env-user"
+            check(_resolve_user(None) == "env-user", "the environment user is next")
+            del os.environ["ARCGIS_SERVER_USER"]
+            module.input = lambda prompt: "  typed-user  "
+            try:
+                check(_resolve_user(None) == "typed-user", "the prompt is last, and trimmed")
+            finally:
+                del module.input
+            check(_resolve_password() == "stub-pass-n3m4", "the environment password wins")
+            del os.environ["ARCGIS_SERVER_PASSWORD"]
+            getpass.getpass = lambda prompt: "typed-secret"
+            check(_resolve_password() == "typed-secret", "else getpass prompts for it")
+
+            stub = _StubAdmin([])
+            try:
+                raises(lambda: real_http(stub.url + "/proxy", {}), TransientError,
+                       "an HTML page with HTTP 200 is a transient fault, not success", "non-JSON")
+            finally:
+                stub.close()
+            import socket
+            closed = socket.socket()
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+            closed.close()
+            raises(lambda: real_http("http://127.0.0.1:%d/x" % port, {}), TransientError,
+                   "a refused connection is a transient fault")
+
+            install(http=_FakeServer(token_body={"expires": 1}))
+            raises(lambda: get_token("b", "u", "p", False, 1), SvcGuardError,
+                   "a token answer without a token is refused", "no token")
+            install(http=_FakeServer(stop_body={"messages": ["queued"]}))
+            raises(lambda: manage_service("b", "S.MapServer", "t", "stop", False, 1),
+                   SvcGuardError, "a stop answer with no status is not taken as success",
+                   "unexpected body")
+            raises(lambda: _FakeServer()("https://s.example.org/x/other", {}), AssertionError,
+                   "the fake server refuses a URL it does not know")
+            raises(_explode, AssertionError, "_explode refuses any call")
+
+            stuck = os.path.join(work, "svcguard_stuck.log")
+            os.mkdir(stuck)
+            check(_prune_logs(work, 0) == [] and os.path.isdir(stuck),
+                  "a log entry that cannot be deleted is skipped, not fatal")
+
+            # ---- group S: the harness can fail ---------------------------
+            scratch = _Checker()
+            _quiet(scratch, False, "x")
+            check(scratch.failed == 1, "check() records a failure  <-- pinned defect")
+            for fn, exc_type, text, what in (
+                    (lambda: None, ValueError, None, "a call that raised nothing"),
+                    (lambda: int("x"), KeyError, None, "the wrong exception type"),
+                    (lambda: int("x"), ValueError, "absent", "a message without the text")):
+                scratch = _Checker()
+                _quiet(_raises, scratch, fn, exc_type, "x", text)
+                check(scratch.failed == 1, "raises() records %s" % what)
+        finally:
+            getpass.getpass = real_getpass
+            module.LOG_DIR = real_log_dir
+            os.environ.clear()
+            os.environ.update(saved_env)
+            _close_logging()
+            shutil.rmtree(work, ignore_errors=True)
 
     finally:
         module._http_json = real_http
