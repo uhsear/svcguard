@@ -377,6 +377,7 @@ def build_parser():
         description="Guarantee an ArcGIS Server service restarts around risky maintenance, "
                     "even on failure.",
         epilog="Password: env ARCGIS_SERVER_PASSWORD, else prompt. There is no --password flag.",
+        allow_abbrev=False,
     )
     parser.add_argument("--server-url",
                         help="AGS admin REST base, e.g. https://gis.example.org/server")
@@ -843,6 +844,11 @@ def self_test():
         code, out, err = _quiet(main, ["--server-url", "u", "--service", "NoDot",
                                        "--command", "c"])
         check(code == 64, "--service must be NAME.TYPE")
+        try:
+            _quiet(build_parser().parse_args, ["--ap"])
+            check(False, "a unique prefix of --apply is refused by the parser  <-- pinned defect")
+        except SystemExit:
+            check(True, "a unique prefix of --apply is refused by the parser  <-- pinned defect")
         check(build_parser().parse_args([]).apply is False, "--apply defaults to OFF")
         check(build_parser().parse_args([]).insecure is False, "--insecure defaults to OFF")
         check(build_parser().parse_args([]).timeout == 120, "--timeout defaults to 120")

@@ -17,12 +17,14 @@ PASS  12  HTTP 200 + status=error is a failure  <-- pinned defect
 ...
 PASS  64  command NEVER runs when wait-for-STOPPED times out  <-- pinned defect
 ...
-PASS  91  log pruning keeps exactly LOG_RETENTION files
+PASS  79  a unique prefix of --apply is refused by the parser  <-- pinned defect
+...
+PASS  92  log pruning keeps exactly LOG_RETENTION files
 ------------------------------------------------------------
-91 assertions, 0 failed
+92 assertions, 0 failed
 ```
 
-91 assertions, no sockets, no credentials, 0.6 seconds on Python 3.13.
+92 assertions, no sockets, no credentials, 0.8 seconds on Python 3.13.
 
 ## Install
 
@@ -137,6 +139,15 @@ by three backoffs.
 - **Command output is not captured.** The command inherits stdout and stderr, so its output
   goes to your console, not into the svcguard log. Only its exit status and duration are
   recorded.
+- **A restart does not prove the data is current.** svcguard proves the service is up again.
+  It does not prove that the rebuilt artifact matches its source. Usually you compare a
+  last-edited timestamp, but a source layer without editor tracking has none. Checking derived
+  columns against their source field is not enough either. A renamed feature or a moved point
+  changes what the artifact should hold, and the derived columns still agree. One fix is to
+  hash every input the build reads, attributes and geometry, and write the hash beside the
+  deployed artifact. The next preflight hashes the source again and compares. No stored hash
+  means you cannot prove the artifact is current. svcguard does none of this, so put that check
+  in your maintenance command.
 
 ## Contributing
 
