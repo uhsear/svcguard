@@ -9,6 +9,20 @@ SEVERAL SERVICES
     was sent for is then started, each with its own fresh token, and one failed
     start never skips the starts after it. When no stop was sent, nothing is started.
 
+NODE NAMES
+    --node NAME (repeatable) states which machines of the site this run may touch.
+    svcguard stops a service through the site endpoint and cannot aim at one machine,
+    so --node is a check, not a filter. A name the site does not list refuses the
+    run before any stop (exit 1); it never falls through to "all nodes". Machines
+    the site has and --node does not name are warned about. Without --node, no
+    machine call is made.
+
+SAVED LIST
+    --list-file PATH keeps the services a run guards. The next run compares its own
+    list with the saved one. A service that dropped out is refused (exit 1) unless
+    --allow-shrink says the shrink is deliberate. The file is written only with
+    --apply, and only when it is new, grew, or --allow-shrink accepted a shrink.
+
 Stdlib only. Python 3.9+.
 
 CONFIG PRECEDENCE (identical to the README):
@@ -19,12 +33,13 @@ The password is never accepted as a flag, never logged, and never written to dis
 
 EXIT CODES
     0   every service stopped, command succeeded, every service started
-    1   the command was REFUSED: a service never reached STOPPED, or the login or the
-        server failed before the first stop; every start that was needed succeeded
+    1   the command was REFUSED: a service never reached STOPPED, the login or the
+        server failed before the first stop, a --node is not in the site, or the saved
+        list shrank; every start that was needed succeeded
     2   command failed (non-zero or raised); restarts succeeded
     3   at least one service could not be started again. A human needs to look now
    64   usage or setup error: a bad flag, a bad value, no credentials, an unwritable
-        log directory. Nothing was contacted
+        log directory, an unreadable or unwritable saved list. Nothing was contacted
 """
 
 import argparse
@@ -43,7 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ==========================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -102,6 +117,19 @@ def _safe(obj):
     return obj
 
 
+def _scrub(text, data):
+    """Mask the secret values of a request form inside an error message.
+
+    A GET carries its token in the query string, and http.client puts the whole request
+    target in some of its messages.
+    """
+    for key, value in data.items():
+        if key.lower() in _SECRET_KEYS and value:
+            for form in (str(value), urllib.parse.quote_plus(str(value))):
+                text = text.replace(form, "***REDACTED***")
+    return text
+
+
 def _prune_logs(log_dir, keep=LOG_RETENTION):
     files = sorted(glob.glob(os.path.join(log_dir, "svcguard_*.log")))
     removed = []
@@ -158,18 +186,21 @@ def _ssl_context(insecure):
     return ctx
 
 
-def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT):
-    """POST a form body, return the parsed JSON object. The one HTTP chokepoint."""
-    body = urllib.parse.urlencode(data).encode("utf-8")
+def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POST"):
+    """POST a form body (or GET with it as a query), return the parsed JSON object.
+
+    The one HTTP chokepoint. Only the admin `machines` resource is documented as GET
+    only; everything else here is a POST with the token in the body. A GET puts the token
+    in the query string, so no message below may carry the full request URL.
+    """
+    form = urllib.parse.urlencode(data)
+    headers = {"User-Agent": "svcguard/%s" % __version__}
     try:
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "svcguard/%s" % __version__,
-            },
-        )
+        if method == "GET":
+            request = urllib.request.Request(url + "?" + form, headers=headers)
+        else:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            request = urllib.request.Request(url, data=form.encode("utf-8"), headers=headers)
         opened = urllib.request.urlopen(
             request, timeout=http_timeout, context=_ssl_context(insecure)
         )
@@ -184,13 +215,14 @@ def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT):
         if exc.code >= 500 or exc.code == 429:
             raise TransientError("HTTP %s from %s" % (exc.code, url))
         raise SvcGuardError("HTTP %s from %s (not retryable)" % (exc.code, url))
+    except (ValueError, http.client.InvalidURL) as exc:
+        # A URL urllib or http.client cannot use. No retry will fix it, and the message
+        # can carry the request target, which holds the token on a GET.
+        raise SvcGuardError("bad request URL %s: %s" % (url, _scrub(str(exc), data)))
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         # HTTPException covers a body cut short (IncompleteRead) and a garbage status
         # line (BadStatusLine); both are transport faults and clear on a retry.
         raise TransientError("%s: %s" % (type(exc).__name__, exc))
-    except ValueError as exc:
-        # A URL urllib cannot parse (no scheme). No retry will fix it.
-        raise SvcGuardError("bad request URL %s: %s" % (url, exc))
 
     try:
         parsed = json.loads(raw)
@@ -219,13 +251,14 @@ def _backoff(attempt):
     return min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** (attempt - 1)))
 
 
-def _request(url, data, insecure, retries, what):
+def _request(url, data, insecure, retries, what, method="POST"):
     """Retry transport failures with backoff. Never retry a server-side refusal."""
+    extra = {} if method == "POST" else {"method": method}
     attempt = 0
     while True:
         attempt += 1
         try:
-            resp = _http_json(url, data, insecure, HTTP_TIMEOUT)
+            resp = _http_json(url, data, insecure, HTTP_TIMEOUT, **extra)
         except TransientError as exc:
             if attempt >= retries:
                 raise SvcGuardError("%s failed after %d attempt(s): %s" % (what, attempt, exc))
@@ -289,6 +322,49 @@ def get_service_state(server_url, service, token, insecure, retries):
     return resp.get("realTimeState", "UNKNOWN")
 
 
+def get_machines(server_url, token, insecure, retries):
+    """The machine names the site lists. The admin machines resource is GET only."""
+    resp = _request(
+        "%s/admin/machines" % server_url.rstrip("/"),
+        {"token": token, "f": "json"},
+        insecure,
+        retries,
+        "machine list",
+        method="GET",
+    )
+    machines = resp.get("machines")
+    if not isinstance(machines, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("machineName"), str)
+            and item["machineName"] for item in machines):
+        raise SvcGuardError("machine list: unexpected body %s" % (_safe(resp),))
+    return [item["machineName"] for item in machines]
+
+
+def node_drift(wanted, machines):
+    """Compare --node names with the site's machines. Pure.
+
+    Returns (unknown, unnamed): the wanted names the site does not list, and the site
+    machines no wanted name covers. Machine names compare case-insensitively.
+    """
+    have = set(name.lower() for name in machines)
+    want = set(name.lower() for name in wanted)
+    unknown = [name for name in wanted if name.lower() not in have]
+    unnamed = [name for name in machines if name.lower() not in want]
+    return unknown, unnamed
+
+
+def verify_nodes(server_url, token, nodes, insecure, retries):
+    """Refuse a --node the site does not list. Warn about machines --node leaves out."""
+    machines = get_machines(server_url, token, insecure, retries)
+    unknown, unnamed = node_drift(nodes, machines)
+    if unknown:
+        raise SvcGuardError("--node not in this site: %s. The site lists: %s"
+                            % (", ".join(unknown), ", ".join(machines) or "no machines"))
+    if unnamed:
+        log.warning("svcguard stops through the site endpoint and cannot aim at one "
+                    "machine. --node does not name: %s", ", ".join(unnamed))
+
+
 def wait_for_state(server_url, service, token, target, insecure, retries, timeout):
     """Poll until realTimeState == target. Raise StateTimeout otherwise.
 
@@ -309,6 +385,77 @@ def wait_for_state(server_url, service, token, target, insecure, retries, timeou
                 "service did not reach %s within %ss" % (target, timeout)
             )
         _sleep(POLL_INTERVAL)
+
+
+# --------------------------------------------------------------------------
+# saved service list
+# --------------------------------------------------------------------------
+
+def list_drift(saved, current):
+    """Compare the saved service list with this run's. Pure.
+
+    Returns (removed, added). Names compare case-insensitively, so a retyped case is not
+    a shrink. Order is not compared: only the set decides.
+    """
+    now = set(name.lower() for name in current)
+    before = set(name.lower() for name in saved)
+    removed = [name for name in saved if name.lower() not in now]
+    added = [name for name in current if name.lower() not in before]
+    return removed, added
+
+
+def list_verdict(saved, current, allow_shrink):
+    """Decide what this run does with the saved list. Pure.
+
+    Returns (verdict, note). The verdict is first, same, grew, shrunk (refuse) or
+    allowed (a shrink --allow-shrink accepted). saved is None when no list exists yet.
+    """
+    if saved is None:
+        return "first", "no saved list yet; this run's list will be saved"
+    removed, added = list_drift(saved, current)
+    if removed and not allow_shrink:
+        return "shrunk", ("the saved list shrank: %s no longer named. A missing service "
+                          "is not stopped before the command and is not started after "
+                          "it. Add it back, or pass --allow-shrink if the shrink is "
+                          "deliberate" % ", ".join(removed))
+    if removed:
+        return "allowed", ("the saved list shrank and --allow-shrink accepted it: %s "
+                           "dropped" % ", ".join(removed))
+    if added:
+        return "grew", "the saved list grew: %s added" % ", ".join(added)
+    return "same", "the saved list matches this run"
+
+
+def read_list(path):
+    """Return the saved service names, or None when the file does not exist.
+
+    A file that exists but cannot be read as a svcguard list raises SvcGuardError. It
+    is never read as "no list", because that would let a damaged file hide a shrink.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            doc = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise SvcGuardError("saved list %s cannot be read (%s). Fix it or delete it"
+                            % (path, exc))
+    names = doc.get("services") if isinstance(doc, dict) else None
+    if not isinstance(names, list) or not names or not all(
+            isinstance(name, str) and "." in name and set(name) <= _SERVICE_CHARS
+            for name in names):
+        raise SvcGuardError("saved list %s is not a svcguard list: expected "
+                            '{"services": ["Name.Type", ...]}. Fix it or delete it' % path)
+    return names
+
+
+def write_list(path, services):
+    """Save the services this run guards. Write a temp file, then replace the list."""
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump({"svcguard_list": 1, "services": services}, handle, indent=2)
+        handle.write("\n")
+    os.replace(temp, path)
 
 
 # --------------------------------------------------------------------------
@@ -374,8 +521,12 @@ def _start_one(server_url, service, username, password, insecure, retries, timeo
         return False
 
 
-def guard(server_url, services, command, username, password, insecure, retries, timeout):
-    """stop each -> command -> ALWAYS start each, independently. Returns an exit code."""
+def guard(server_url, services, command, username, password, insecure, retries, timeout,
+          nodes=None):
+    """stop each -> command -> ALWAYS start each, independently. Returns an exit code.
+
+    nodes, when given, is checked against the site's machines before the first stop.
+    """
     reached = -1      # index of the last service a stop was sent for; -1 = none yet
     all_stopped = False
     command_rc = None
@@ -385,6 +536,8 @@ def guard(server_url, services, command, username, password, insecure, retries, 
         try:
             log.info("Requesting token for stop phase...")
             token = get_token(server_url, username, password, insecure, retries)
+            if nodes:
+                verify_nodes(server_url, token, nodes, insecure, retries)
             for index, service in enumerate(services):
                 reached = index
                 log.info("Stopping %s ...", service)
@@ -460,6 +613,22 @@ def validate_target(server_url, services):
     return None
 
 
+_NODE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+
+
+def validate_nodes(nodes):
+    """Return a usage-error message for --node values, or None. Pure."""
+    for name in nodes:
+        if not name or not set(name) <= _NODE_CHARS:
+            return "--node must be a machine name of letters, digits, dot, dash or underscore"
+    folded = [name.lower() for name in nodes]
+    repeated = sorted(set(name for name in folded if folded.count(name) > 1))
+    if repeated:
+        return "--node given more than once: %s" % ", ".join(repeated)
+    return None
+
+
 def build_parser():
     parser = _Parser(
         prog="svcguard",
@@ -485,6 +654,14 @@ def build_parser():
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS verification (off by default; the source script "
                              "hardcoded verify=False, this reverses that)")
+    parser.add_argument("--node", action="append",
+                        help="machine name the run may touch; repeat for several. A name "
+                             "the site does not list refuses the run before any stop")
+    parser.add_argument("--list-file",
+                        help="JSON file that keeps the services this run guards. A later "
+                             "run whose list dropped one is refused")
+    parser.add_argument("--allow-shrink", action="store_true",
+                        help="accept a shorter service list than the one in --list-file")
     parser.add_argument("--self-test", action="store_true",
                         help="run the offline assertion suite and exit")
     return parser
@@ -538,6 +715,25 @@ def main(argv=None):
     if args.retries < 1 or args.timeout < 1:
         sys.stderr.write("error: --retries and --timeout must be >= 1\n")
         return 64
+    nodes = args.node or []
+    problem = validate_nodes(nodes)
+    if problem:
+        sys.stderr.write("error: %s\n" % problem)
+        return 64
+    if args.allow_shrink and not args.list_file:
+        sys.stderr.write("error: --allow-shrink needs --list-file\n")
+        return 64
+    verdict = note = None
+    if args.list_file:
+        try:
+            saved = read_list(args.list_file)
+        except SvcGuardError as exc:
+            sys.stderr.write("error: %s\n" % exc)
+            return 64
+        verdict, note = list_verdict(saved, services, args.allow_shrink)
+    if verdict == "shrunk" and args.apply:
+        sys.stderr.write("REFUSED: %s\n" % note)
+        return 1
 
     if not args.apply:
         print("DRY RUN. No HTTP call was made. Re-run with --apply to execute.")
@@ -547,10 +743,18 @@ def main(argv=None):
         print("  run      : %r, only if every service confirmed STOPPED" % args.command)
         print("  start    : %s (each with a fresh token; a failed start skips no other)"
               % " -> ".join(restart_order(services, len(services) - 1)))
+        if nodes:
+            print("  nodes    : %s (checked against the site's machine list before any stop)"
+                  % ", ".join(nodes))
+        if verdict:
+            print("  list     : %s" % note)
         print("  tls      : %s" % ("VERIFICATION DISABLED (--insecure)" if args.insecure
                                    else "verified"))
         print("  timeout  : %ss   retries: %s   poll: %ss" % (args.timeout, args.retries,
                                                               POLL_INTERVAL))
+        if verdict == "shrunk":
+            print("  WOULD REFUSE: the saved list shrank. Exit 1.")
+            return 1
         return 0
 
     username = _resolve_user(args.user)
@@ -572,8 +776,17 @@ def main(argv=None):
     if args.server_url.lower().startswith("http://"):
         log.warning("--server-url is http://: the admin password travels in clear text.")
     try:
+        if verdict:
+            log.info("saved list: %s", note)
+        if verdict in ("first", "grew", "allowed"):
+            try:
+                write_list(args.list_file, services)
+            except OSError as exc:
+                sys.stderr.write("error: cannot write the saved list %s: %s\n"
+                                 % (args.list_file, exc))
+                return 64
         code = guard(args.server_url, services, args.command, username, password,
-                     args.insecure, args.retries, args.timeout)
+                     args.insecure, args.retries, args.timeout, nodes)
     finally:
         log.info("svcguard finished. Log: %s", log_path)
         _close_logging()
@@ -707,7 +920,8 @@ class _StubAdmin(object):
 
     CUT = object()
 
-    def __init__(self, services, fail_start=(), never_stops=(), cut_status=0):
+    def __init__(self, services, fail_start=(), never_stops=(), cut_status=0, machines=(),
+                 machines_reply=None):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import threading
         self.state = dict((name, "STARTED") for name in services)
@@ -716,6 +930,11 @@ class _StubAdmin(object):
         self.cut_status = cut_status
         self.ops = []
         self.forms = []
+        self.gets = []
+        self.get_forms = []
+        self.machines_reply = machines_reply if machines_reply is not None else {
+            "machines": [{"machineName": name, "adminURL": "https://%s:6443/arcgis/admin" % name}
+                         for name in machines]}
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -735,18 +954,32 @@ class _StubAdmin(object):
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def do_GET(self):
+                # The one GET resource of the admin API this tool reads: machines.
+                stub.gets.append(self.path)
+                stub.get_forms.append(urllib.parse.parse_qs(self.path.partition("?")[2]))
+                raw = json.dumps(stub.machines_reply).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def log_message(self, *_args):
                 pass
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.url = "http://127.0.0.1:%d/x" % self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                         kwargs={"poll_interval": 0.01})
         self.thread.daemon = True
         self.thread.start()
 
     def answer(self, path):
         if path.endswith("/admin/generateToken"):
             return {"token": self.TOKEN, "expires": 1}
+        if path.endswith("/admin/machines"):
+            # The machines resource is documented as GET only; a POST here is a regression.
+            return {"error": {"code": 405, "message": "machines accepts GET only"}}
         if path.endswith("/proxy"):
             return "<html>proxy sign-in page</html>"
         if path.endswith("/bom"):
@@ -1086,7 +1319,7 @@ def self_test():
             flags.update(action.option_strings)
         check("--password" not in flags, "there is no --password flag")
         check("--apply" in flags and "--insecure" in flags, "the documented flags exist")
-        check(len(flags) == 11, "exactly 9 flags plus -h/--help are defined")
+        check(len(flags) == 14, "exactly 12 flags plus -h/--help are defined")
 
         # ---- group K: the token never reaches the log file ---------------
         import shutil
@@ -1495,6 +1728,313 @@ def self_test():
             os.mkdir(stuck)
             check(_prune_logs(work, 0) == [] and os.path.isdir(stuck),
                   "a log entry that cannot be deleted is skipped, not fatal")
+
+            # ---- group T: node names ------------------------------------
+            check("--node" in flags and "--list-file" in flags and "--allow-shrink" in flags,
+                  "the node and saved-list flags exist")
+            check(node_drift(["a.example.org"], ["a.example.org"]) == ([], []),
+                  "a node the site lists, and nothing else, leaves no drift")
+            check(node_drift(["GIS-A"], ["gis-a"]) == ([], []),
+                  "node names compare case-insensitively")
+            check(node_drift(["gis-typo"], ["gis-a", "gis-b"]) == (["gis-typo"],
+                                                                  ["gis-a", "gis-b"]),
+                  "a node the site does not list is unknown, and every site machine is unnamed")
+            check(node_drift(["gis-a"], ["gis-a", "gis-b"]) == ([], ["gis-b"]),
+                  "a site machine --node leaves out is reported as unnamed")
+            check(validate_nodes(["gis-a", "gis-b.example.org", "n_1"]) is None,
+                  "plain machine names pass")
+            check(validate_nodes([""]) is not None and validate_nodes(["a b"]) is not None
+                  and validate_nodes(["a/b"]) is not None,
+                  "an empty node, a space and a slash are usage errors")
+            check("more than once: gis-a" in validate_nodes(["gis-a", "GIS-A"]),
+                  "a node named twice, in any case, is a usage error")
+
+            for body, what in (({"machines": "gis-a"}, "a machines value that is not a list"),
+                               ({"hosts": []}, "a body with no machines key"),
+                               ({"machines": [{"adminURL": "u"}]}, "a machine with no name"),
+                               ({"machines": [{"machineName": ""}]}, "a machine with a blank name"),
+                               ({"machines": ["gis-a"]}, "a machine that is not an object")):
+                def machines_fake(url, data, insecure=False, http_timeout=None, method="POST",
+                                  body=body):
+                    return body
+                install(http=machines_fake)
+                raises(lambda: get_machines("https://s.example.org/x", "t", False, 1),
+                       SvcGuardError, "get_machines refuses %s" % what, "unexpected body")
+            install(http=lambda url, data, insecure=False, http_timeout=None, method="POST":
+                    {"error": {"code": 498, "message": "Invalid token"}})
+            raises(lambda: get_machines("https://s.example.org/x", "t", False, 1),
+                   SvcGuardError, "get_machines refuses an error body", "498")
+
+            stub = _StubAdmin(three, machines=["gis-a.example.org", "gis-b.example.org"])
+            try:
+                install()
+                check(get_machines(stub.url, "TOK-1", False, 1)
+                      == ["gis-a.example.org", "gis-b.example.org"],
+                      "get_machines reads the machine names over real HTTP")
+                check(len(stub.gets) == 1 and stub.forms == [],
+                      "the machines resource is read with one GET and no POST body")
+                check(stub.get_forms[0] == {"token": ["TOK-1"], "f": ["json"]},
+                      "the GET carries the token and f=json in its query")
+                check(stub.gets[0].startswith("/x/admin/machines?"),
+                      "the machines request goes to /admin/machines")
+                check(real_http(stub.url + "/admin/machines", {"token": "TOK-1"})["error"]["code"]
+                      == 405, "the stub, like the documented resource, refuses a POST to machines")
+            finally:
+                stub.close()
+
+            secret = "T0K/EN+x=9"
+            check("T0K" not in _scrub("a T0K/EN+x=9 b T0K%2FEN%2Bx%3D9 c", {"token": secret})
+                  and _scrub("keep", {"token": secret, "f": "json"}) == "keep",
+                  "_scrub masks a token in its raw and its form-encoded spelling")
+            check(_scrub("json", {"f": "json"}) == "json" and _scrub("x", {"token": ""}) == "x",
+                  "_scrub leaves a form with no secret alone")
+            install()
+            exc = raises(lambda: real_http("http://127.0.0.1:9/a b", {"token": secret, "f": "json"},
+                                           method="GET"),
+                         SvcGuardError, "a GET to a URL http.client rejects is a refusal",
+                         "bad request URL")
+            check(exc is not None and "T0K" not in str(exc),
+                  "that refusal does not carry the token from the query  <-- pinned defect")
+
+            # The guard over real HTTP: a matching node runs, a typo refuses before any stop.
+            names = ["gis-a.example.org", "gis-b.example.org"]
+            ran = []
+            collected = _Collect()
+            log.addHandler(collected)
+            log.setLevel(logging.WARNING)
+            stub = _StubAdmin(three, machines=names)
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, names)
+            finally:
+                stub.close()
+                log.removeHandler(collected)
+                log.setLevel(logging.CRITICAL)
+            check(code == 0 and ran == ["noop"], "every node named and listed: the run goes ahead")
+            check(len(stub.gets) == 1 and ops(stub, "stop") == three,
+                  "the machine list is read once, before the stops")
+            check(not [line for line in collected.lines if "does not name" in line],
+                  "no warning when --node names every machine")
+
+            ran = []
+            collected = _Collect()
+            log.addHandler(collected)
+            log.setLevel(logging.WARNING)
+            stub = _StubAdmin(three, machines=names)
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, [names[0]])
+            finally:
+                stub.close()
+                log.removeHandler(collected)
+                log.setLevel(logging.CRITICAL)
+            check(code == 0 and ran == ["noop"],
+                  "a machine --node leaves out does not refuse the run")
+            check([line for line in collected.lines if "does not name: gis-b.example.org" in line],
+                  "it is warned about instead, by name")
+
+            ran = []
+            collected = _Collect()
+            log.addHandler(collected)
+            log.setLevel(logging.WARNING)
+            stub = _StubAdmin(three, machines=names)
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, ["gis-typo"])
+            finally:
+                stub.close()
+                log.removeHandler(collected)
+                log.setLevel(logging.CRITICAL)
+            check(code == 1 and ran == [],
+                  "a mistyped --node refuses the run instead of using every node"
+                  "  <-- pinned defect")
+            check(stub.ops == [], "a mistyped --node sends no stop, no start and no status poll"
+                  "  <-- pinned defect")
+            check(tokens(stub) == 1, "a refused node asks for no restart token")
+            check([line for line in collected.lines if "--node not in this site: gis-typo. "
+                   "The site lists: gis-a.example.org, gis-b.example.org" in line],
+                  "the refusal names the typo and lists the site's machines")
+
+            ran = []
+            stub = _StubAdmin(three, machines_reply={"machines": "broken"})
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, names)
+            finally:
+                stub.close()
+            check(code == 1 and ran == [] and stub.ops == [],
+                  "a machine list svcguard cannot read refuses the run, it does not guess"
+                  "  <-- pinned defect")
+
+            stub = _StubAdmin(three, machines=[])
+            try:
+                install(run=lambda cmd: 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, names)
+            finally:
+                stub.close()
+            check(code == 1 and stub.ops == [], "a site that lists no machines refuses every node")
+
+            stub = _StubAdmin(three, machines=names)
+            try:
+                install(run=lambda cmd: 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 0 and stub.gets == [],
+                  "without --node no machine call is made, as before")
+
+            # ---- group U: the saved service list -------------------------
+            ab = ["A.MapServer", "B.GeocodeServer"]
+            check(list_drift(ab, ab) == ([], []), "an unchanged list has no drift")
+            check(list_drift(ab, ["b.geocodeserver", "a.mapserver"]) == ([], []),
+                  "a reordered or retyped-case list is not a change")
+            check(list_drift(three, ab) == (["C.FeatureServer"], []),
+                  "a service that dropped out is reported as removed")
+            check(list_drift(ab, three) == ([], ["C.FeatureServer"]),
+                  "a service that joined is reported as added")
+            check(list_verdict(None, ab, False)[0] == "first", "no saved list is a first run")
+            check(list_verdict(ab, ab, False)[0] == "same", "the same list is same")
+            check(list_verdict(ab, three, False)[0] == "grew", "a longer list grew")
+            verdict, note = list_verdict(three, ab, False)
+            check(verdict == "shrunk" and "C.FeatureServer" in note and "--allow-shrink" in note,
+                  "a shorter list is refused and the note names the dropped service"
+                  "  <-- pinned defect")
+            check(list_verdict(three, ["A.MapServer", "B.GeocodeServer", "D.MapServer"],
+                               False)[0] == "shrunk",
+                  "a swap is a shrink: one service added does not hide one dropped"
+                  "  <-- pinned defect")
+            check(list_verdict(three, ab, True)[0] == "allowed",
+                  "--allow-shrink turns the refusal into an accepted shrink")
+
+            lst = os.path.join(work, "list.json")
+            check(read_list(lst) is None, "a list file that does not exist reads as no list")
+            write_list(lst, three)
+            check(read_list(lst) == three and not os.path.exists(lst + ".tmp"),
+                  "write_list round-trips and leaves no temp file")
+            with open(lst, "w", encoding="utf-8-sig") as handle:
+                json.dump({"services": ab}, handle)
+            check(read_list(lst) == ab, "a list saved by an editor with a byte order mark reads")
+            for text, what in (("{not json", "invalid JSON"), ("[]", "a bare list"),
+                               ('{"services": []}', "an empty service list"),
+                               ('{"services": "A.MapServer"}', "a services value that is a string"),
+                               ('{"services": ["NoDot"]}', "a name with no type"),
+                               ('{"services": ["A B.MapServer"]}', "a name with a space"),
+                               ('{"services": [7]}', "a name that is not a string")):
+                with open(lst, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                raises(lambda: read_list(lst), SvcGuardError,
+                       "read_list refuses %s, it never reads it as no list  <-- pinned defect"
+                       % what, "Fix it or delete it")
+            raises(lambda: read_list(work), SvcGuardError,
+                   "read_list refuses a path that is a directory", "cannot be read")
+            raises(lambda: write_list(os.path.join(work, "no-such-dir", "list.json"), ab), OSError,
+                   "write_list reports an unwritable path")
+
+            # The CLI: dry run, then real runs over HTTP against the stub.
+            os.environ["ARCGIS_SERVER_USER"] = "u"
+            os.environ["ARCGIS_SERVER_PASSWORD"] = "stub-pass-t5"
+            lst = os.path.join(work, "saved.json")
+            base = ["--server-url", "https://s.example.org/x", "--command", "c"]
+            install(http=_explode, run=_explode)
+            code, out, err = _quiet(main, base + ["--service", "A.MapServer", "--list-file", lst,
+                                                  "--node", "gis-a", "--node", "gis-b"])
+            check(code == 0 and "list     : no saved list yet" in out
+                  and "nodes    : gis-a, gis-b" in out,
+                  "the dry run shows the node and list lines and makes zero HTTP calls")
+            check(not os.path.exists(lst), "a dry run never writes the saved list  <-- pinned defect")
+            for argv, text, what in (
+                    (["--service", "A.MapServer", "--node", "a b"], "--node must be", "a bad --node"),
+                    (["--service", "A.MapServer", "--node", ""], "--node must be", "an empty --node"),
+                    (["--service", "A.MapServer", "--node", "a", "--node", "A"], "more than once",
+                     "a repeated --node"),
+                    (["--service", "A.MapServer", "--allow-shrink"], "needs --list-file",
+                     "--allow-shrink with no --list-file")):
+                code, out, err = _quiet(main, base + argv)
+                check(code == 64 and text in err, "%s is a usage error" % what)
+
+            def marker_command(name):
+                path = os.path.join(work, "ran-" + name)
+                return path, '"%s" -c "open(r\'%s\', \'w\').close()"' % (sys.executable, path)
+
+            def cli_run(stub_services, services, extra, name, machines=()):
+                """One real --apply run against a stub. Returns (code, err, ran, stub)."""
+                path, command = marker_command(name)
+                module.LOG_DIR = os.path.join(work, "logs-" + name)
+                stub = _StubAdmin(stub_services, machines=machines)
+                argv = ["--server-url", stub.url, "--command", command, "--apply",
+                        "--timeout", "20"] + extra
+                for service in services:
+                    argv += ["--service", service]
+                try:
+                    install()
+                    code, out, err = _quiet(main, argv)
+                finally:
+                    stub.close()
+                    hush()
+                return code, err, os.path.exists(path), stub
+
+            code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst], "first")
+            check(code == 0 and ran_it and read_list(lst) == three,
+                  "a first --apply run saves the list it guarded")
+            logs = glob.glob(os.path.join(work, "logs-first", "svcguard_*.log"))
+            with open(logs[0], "r", encoding="utf-8") as handle:
+                contents = handle.read()
+            check("saved list: no saved list yet" in contents, "the log records the list decision")
+            before = os.path.getmtime(lst)
+            code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst], "same")
+            check(code == 0 and ran_it and os.path.getmtime(lst) == before,
+                  "a run with the same list does not rewrite the file")
+
+            code, err, ran_it, stub = cli_run(three, three[:2], ["--list-file", lst], "shrunk")
+            check(code == 1 and not ran_it and stub.ops == [] and stub.forms == [],
+                  "a shorter list refuses the run before the server or the command is touched"
+                  "  <-- pinned defect")
+            check("REFUSED: the saved list shrank: C.FeatureServer" in err,
+                  "stderr names the service the list lost")
+            check(read_list(lst) == three,
+                  "a refused shrink leaves the saved list as it was  <-- pinned defect")
+            code, out, err = _quiet(main, base + ["--service", three[0], "--service", three[1],
+                                                  "--list-file", lst])
+            check(code == 1 and "WOULD REFUSE" in out and "stop     :" in out,
+                  "the dry run shows the plan, says it would refuse, and exits 1")
+            code, err, ran_it, stub = cli_run(three, three[:2], ["--list-file", lst,
+                                                                 "--allow-shrink"], "allowed")
+            check(code == 0 and ran_it and read_list(lst) == three[:2],
+                  "--allow-shrink runs, and the saved list becomes the shorter one")
+            code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst], "grew")
+            check(code == 0 and ran_it and read_list(lst) == three,
+                  "a longer list runs, and the saved list grows")
+
+            with open(lst, "w", encoding="utf-8") as handle:
+                handle.write("{broken")
+            code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst], "broken")
+            check(code == 64 and not ran_it and stub.ops == [] and "Fix it or delete it" in err,
+                  "a damaged saved list is a usage error, not an empty list  <-- pinned defect")
+            code, out, err = _quiet(main, base + ["--service", "A.MapServer", "--list-file", lst])
+            check(code == 64, "the dry run refuses a damaged saved list too")
+            os.remove(lst)
+            code, err, ran_it, stub = cli_run(three, three, ["--list-file",
+                                                             os.path.join(work, "no-dir", "l.json")],
+                                              "nowrite")
+            check(code == 64 and not ran_it and stub.ops == [] and "cannot write the saved list" in err,
+                  "a saved list that cannot be written exits 64 before any service is touched"
+                  "  <-- pinned defect")
+
+            code, err, ran_it, stub = cli_run(three, three, ["--node", "gis-a.example.org"],
+                                              "node-ok", machines=["gis-a.example.org"])
+            check(code == 0 and ran_it and len(stub.gets) == 1,
+                  "main --node runs when the site lists the node")
+            logs = glob.glob(os.path.join(work, "logs-node-ok", "svcguard_*.log"))
+            with open(logs[0], "r", encoding="utf-8") as handle:
+                contents = handle.read()
+            check(_StubAdmin.TOKEN not in contents and "stub-pass-t5" not in contents
+                  and stub.get_forms[0]["token"] == [_StubAdmin.TOKEN],
+                  "the token sent in the machines query never reaches the log file")
+            code, err, ran_it, stub = cli_run(three, three, ["--node", "gis-typo"], "node-bad",
+                                              machines=["gis-a.example.org"])
+            check(code == 1 and not ran_it and stub.ops == [] and "--node not in this site" in err,
+                  "main refuses a mistyped --node with exit 1 and starts nothing")
+            del os.environ["ARCGIS_SERVER_USER"], os.environ["ARCGIS_SERVER_PASSWORD"]
 
             # ---- group S: the harness can fail ---------------------------
             scratch = _Checker()
