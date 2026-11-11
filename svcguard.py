@@ -181,30 +181,39 @@ def _close_logging():
 def _ssl_context(insecure):
     ctx = ssl.create_default_context()
     if insecure:
-        # Deliberate reversal of the source script, which hardcoded verify=False.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
 def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POST"):
     """POST a form body (or GET with it as a query), return the parsed JSON object.
 
-    The one HTTP chokepoint. Only the admin `machines` resource is documented as GET
-    only; everything else here is a POST with the token in the body. A GET puts the token
+    The one HTTP chokepoint. Only the admin `machines` read is a GET; everything else
+    here is a POST with the token in the body. A GET puts the token
     in the query string, so no message below may carry the full request URL.
     """
     form = urllib.parse.urlencode(data)
     headers = {"User-Agent": "svcguard/%s" % __version__}
     try:
         if method == "GET":
+            # No redirect handler: urllib would repeat this query, token included, at
+            # whatever host the Location header names. A redirect becomes an HTTPError.
             request = urllib.request.Request(url + "?" + form, headers=headers)
+            opened = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=_ssl_context(insecure)), _NoRedirect()
+            ).open(request, timeout=http_timeout)
         else:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             request = urllib.request.Request(url, data=form.encode("utf-8"), headers=headers)
-        opened = urllib.request.urlopen(
-            request, timeout=http_timeout, context=_ssl_context(insecure)
-        )
+            opened = urllib.request.urlopen(
+                request, timeout=http_timeout, context=_ssl_context(insecure)
+            )
         try:
             # utf-8-sig: a byte order mark would make json.loads refuse a good body.
             raw = opened.read().decode("utf-8-sig", "replace")
@@ -324,7 +333,7 @@ def get_service_state(server_url, service, token, insecure, retries):
 
 
 def get_machines(server_url, token, insecure, retries):
-    """The machine names the site lists. The admin machines resource is GET only."""
+    """The machine names the site lists. The documented method for reading machines is GET."""
     resp = _request(
         "%s/admin/machines" % server_url.rstrip("/"),
         {"token": token, "f": "json"},
@@ -663,8 +672,7 @@ def build_parser():
     parser.add_argument("--retries", type=int, default=3,
                         help="attempts per HTTP call (default 3)")
     parser.add_argument("--insecure", action="store_true",
-                        help="skip TLS verification (off by default; the source script "
-                             "hardcoded verify=False, this reverses that)")
+                        help="skip TLS verification (off by default)")
     parser.add_argument("--node", action="append",
                         help="machine name the site must list; repeat for several. A name "
                              "the site does not list refuses the run before any stop. "
@@ -708,7 +716,16 @@ def _settle_list(path, code):
     confirmed) or one with a failed start must not move the baseline.
     """
     if code in (0, 2):
-        commit_list(path)
+        try:
+            commit_list(path)
+        except OSError as exc:
+            # The command already ran. Keep its exit code: a locked or read-only list file
+            # must not turn a finished maintenance run into a "refused" exit 1.
+            log.error("the run finished but the saved list %s was not updated: %s", path, exc)
+            try:
+                os.remove(path + ".tmp")
+            except OSError as rm_exc:
+                log.warning("cannot remove %s.tmp: %s", path, rm_exc)
         return
     log.warning("saved list not updated: the run ended with exit %d before it finished "
                 "guarding", code)
@@ -964,6 +981,7 @@ class _StubAdmin(object):
         self.forms = []
         self.gets = []
         self.get_forms = []
+        self.machines_redirect = None
         self.machines_reply = machines_reply if machines_reply is not None else {
             "machines": [{"machineName": name, "adminURL": "https://%s:6443/arcgis/admin" % name}
                          for name in machines]}
@@ -990,6 +1008,12 @@ class _StubAdmin(object):
                 # The one GET resource of the admin API this tool reads: machines.
                 stub.gets.append(self.path)
                 stub.get_forms.append(urllib.parse.parse_qs(self.path.partition("?")[2]))
+                if stub.machines_redirect:
+                    self.send_response(302)
+                    self.send_header("Location", stub.machines_redirect + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 raw = json.dumps(stub.machines_reply).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(raw)))
@@ -1010,7 +1034,7 @@ class _StubAdmin(object):
         if path.endswith("/admin/generateToken"):
             return {"token": self.TOKEN, "expires": 1}
         if path.endswith("/admin/machines"):
-            # The machines resource is documented as GET only; a POST here is a regression.
+            # The documented method for reading machines is GET; a POST here is a regression.
             return {"error": {"code": 405, "message": "machines accepts GET only"}}
         if path.endswith("/proxy"):
             return "<html>proxy sign-in page</html>"
@@ -1114,7 +1138,7 @@ def self_test():
         check(_ssl_context(True).check_hostname is False,
               "--insecure disables hostname checking")
         check(_ssl_context(False).verify_mode == ssl.CERT_REQUIRED,
-              "default verifies certificates (source hardcoded verify=False)")
+              "default verifies certificates")
         check(_ssl_context(False).check_hostname is True,
               "default checks hostname")
 
@@ -1907,6 +1931,21 @@ def self_test():
             check(code == 1 and stub.ops == [], "a site that lists no machines refuses every node")
 
             stub = _StubAdmin(three, machines=names)
+            other = _StubAdmin(three, machines=names)
+            stub.machines_redirect = other.url.rpartition("/x")[0]
+            ran = []
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20, names)
+            finally:
+                stub.close()
+                other.close()
+            check(code == 1 and ran == [] and stub.ops == [] and other.gets == []
+                  and other.get_forms == [],
+                  "a redirected machine list refuses the run and the token goes nowhere else"
+                  "  <-- pinned defect")
+
+            stub = _StubAdmin(three, machines=names)
             try:
                 install(run=lambda cmd: 0)
                 code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
@@ -2074,6 +2113,9 @@ def self_test():
             _settle_list(os.path.join(work, "no-such.json"), 1)
             check(not os.path.exists(os.path.join(work, "no-such.json")),
                   "settling a failed run with no temp file left only warns")
+            check(_settle_list(os.path.join(work, "no-such.json"), 0) is None
+                  and not os.path.exists(os.path.join(work, "no-such.json")),
+                  "settling a finished run whose temp file vanished only logs the error")
 
             with open(lst, "w", encoding="utf-8") as handle:
                 handle.write("{broken")
@@ -2089,6 +2131,20 @@ def self_test():
             check(code == 64 and not ran_it and stub.ops == [] and "cannot write the saved list" in err,
                   "a saved list that cannot be written exits 64 before any service is touched"
                   "  <-- pinned defect")
+
+            real_commit = module.commit_list
+
+            def locked_commit(path):
+                raise PermissionError("locked by another process")
+            module.commit_list = locked_commit
+            try:
+                code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst],
+                                                  "locked")
+            finally:
+                module.commit_list = real_commit
+            check(code == 0 and ran_it and "was not updated" in err
+                  and not os.path.exists(lst) and not os.path.exists(lst + ".tmp"),
+                  "a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect")
 
             code, err, ran_it, stub = cli_run(three, three, ["--node", "gis-a.example.org"],
                                               "node-ok", machines=["gis-a.example.org"])
@@ -2134,6 +2190,14 @@ def self_test():
         os.environ.update(original_env)
         _close_logging()
         log.propagate = True
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("svcguard_reload", os.path.abspath(__file__))
+    reloaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reloaded)
+    check(reloaded.__name__ == "svcguard_reload" and reloaded.main is not main,
+          "importing the file runs no main()")
+    _close_logging()
 
     print("-" * 60)
     print("%d assertions, %d failed" % (check.total, check.failed))
