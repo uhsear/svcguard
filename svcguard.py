@@ -21,7 +21,8 @@ SAVED LIST
     --list-file PATH keeps the services a run guards. The next run compares its own
     list with the saved one. A service that dropped out is refused (exit 1) unless
     --allow-shrink says the shrink is deliberate. The file is written only with
-    --apply, and only when it is new, grew, or --allow-shrink accepted a shrink.
+    --apply, only when it is new, grew, or --allow-shrink accepted a shrink, and only
+    after the command ran (exit 0 or 2): a refused or failed-to-start run keeps the old list.
 
 Stdlib only. Python 3.9+.
 
@@ -449,13 +450,23 @@ def read_list(path):
     return names
 
 
-def write_list(path, services):
-    """Save the services this run guards. Write a temp file, then replace the list."""
-    temp = path + ".tmp"
-    with open(temp, "w", encoding="utf-8") as handle:
+def stage_list(path, services):
+    """Write the services this run guards to PATH.tmp. Proves the path is writable.
+
+    The saved list itself is untouched until commit_list.
+    """
+    with open(path + ".tmp", "w", encoding="utf-8") as handle:
         json.dump({"svcguard_list": 1, "services": services}, handle, indent=2)
         handle.write("\n")
-    os.replace(temp, path)
+
+
+def commit_list(path):
+    os.replace(path + ".tmp", path)
+
+
+def write_list(path, services):
+    stage_list(path, services)
+    commit_list(path)
 
 
 # --------------------------------------------------------------------------
@@ -655,8 +666,9 @@ def build_parser():
                         help="skip TLS verification (off by default; the source script "
                              "hardcoded verify=False, this reverses that)")
     parser.add_argument("--node", action="append",
-                        help="machine name the run may touch; repeat for several. A name "
-                             "the site does not list refuses the run before any stop")
+                        help="machine name the site must list; repeat for several. A name "
+                             "the site does not list refuses the run before any stop. "
+                             "A check, not a filter: every machine still stops and starts")
     parser.add_argument("--list-file",
                         help="JSON file that keeps the services this run guards. A later "
                              "run whose list dropped one is refused")
@@ -687,6 +699,23 @@ def _resolve_password():
         return getpass.getpass("ArcGIS Server admin password: ")
     except EOFError:
         return ""
+
+
+def _settle_list(path, code):
+    """Commit the staged list only when the command ran (exit 0 or 2).
+
+    A run refused before the command (unknown node, failed login, a stop that never
+    confirmed) or one with a failed start must not move the baseline.
+    """
+    if code in (0, 2):
+        commit_list(path)
+        return
+    log.warning("saved list not updated: the run ended with exit %d before it finished "
+                "guarding", code)
+    try:
+        os.remove(path + ".tmp")
+    except OSError as exc:
+        log.warning("cannot remove %s.tmp: %s", path, exc)
 
 
 def main(argv=None):
@@ -778,15 +807,18 @@ def main(argv=None):
     try:
         if verdict:
             log.info("saved list: %s", note)
-        if verdict in ("first", "grew", "allowed"):
+        staged = verdict in ("first", "grew", "allowed")
+        if staged:
             try:
-                write_list(args.list_file, services)
+                stage_list(args.list_file, services)
             except OSError as exc:
                 sys.stderr.write("error: cannot write the saved list %s: %s\n"
                                  % (args.list_file, exc))
                 return 64
         code = guard(args.server_url, services, args.command, username, password,
                      args.insecure, args.retries, args.timeout, nodes)
+        if staged:
+            _settle_list(args.list_file, code)
     finally:
         log.info("svcguard finished. Log: %s", log_path)
         _close_logging()
@@ -2004,6 +2036,44 @@ def self_test():
             code, err, ran_it, stub = cli_run(three, three, ["--list-file", lst], "grew")
             check(code == 0 and ran_it and read_list(lst) == three,
                   "a longer list runs, and the saved list grows")
+
+            def slurp(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    return handle.read()
+
+            # A run that never gets past the login must not move the baseline.
+            module.LOG_DIR = os.path.join(work, "logs-nologin")
+            down = _FakeServer(token_failures=99)
+            for saved_names, run_names, extra, label in (
+                    (three, three[:1], ["--allow-shrink"],
+                     "--allow-shrink on a run whose login fails"),
+                    (three[:1], three[:2], [], "a growing list on a run whose login fails")):
+                with open(lst, "w", encoding="utf-8") as handle:
+                    json.dump({"svcguard_list": 1, "services": saved_names}, handle)
+                before_text = slurp(lst)
+                install(http=down)
+                argv = ["--server-url", "https://s.example.org/x", "--command", "c", "--apply",
+                        "--retries", "1", "--list-file", lst] + extra
+                for service in run_names:
+                    argv += ["--service", service]
+                code, out, err = _quiet(main, argv)
+                hush()
+                check(code == 1 and slurp(lst) == before_text
+                      and not os.path.exists(lst + ".tmp"),
+                      "the saved list is unchanged after %s  <-- pinned defect" % label)
+            os.remove(lst)
+            install(http=down)
+            code, out, err = _quiet(main, ["--server-url", "https://s.example.org/x", "--command",
+                                           "c", "--apply", "--retries", "1", "--list-file", lst,
+                                           "--service", three[0]])
+            hush()
+            check(code == 1 and not os.path.exists(lst) and not os.path.exists(lst + ".tmp"),
+                  "a first run that never logs in saves no list  <-- pinned defect")
+            module.LOG_DIR = os.path.join(work, "logs-settle")
+            hush()
+            _settle_list(os.path.join(work, "no-such.json"), 1)
+            check(not os.path.exists(os.path.join(work, "no-such.json")),
+                  "settling a failed run with no temp file left only warns")
 
             with open(lst, "w", encoding="utf-8") as handle:
                 handle.write("{broken")

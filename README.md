@@ -52,18 +52,30 @@ PASS 169  an unwritable log directory exits 64 before any service is touched  <-
 ...
 PASS 175  a reply cut short is retried, not read as a failed start  <-- pinned defect
 ...
-PASS 187  raises() records a message without the text
+PASS 212  a mistyped --node refuses the run instead of using every node  <-- pinned defect
+...
+PASS 226  a shorter list is refused and the note names the dropped service  <-- pinned defect
+...
+PASS 252  a refused shrink leaves the saved list as it was  <-- pinned defect
+...
+PASS 256  the saved list is unchanged after --allow-shrink on a run whose login fails  <-- pinned defect
+PASS 257  the saved list is unchanged after a growing list on a run whose login fails  <-- pinned defect
+PASS 258  a first run that never logs in saves no list  <-- pinned defect
+...
+PASS 262  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
+...
+PASS 269  raises() records a message without the text
 ------------------------------------------------------------
-187 assertions, 0 failed
+269 assertions, 0 failed
 ```
 
-The full run prints all 187 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 269 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
 took 10 to 14 seconds on Windows with Python 3.12 or 3.13 and 2 to 4 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9, 3.12 and 3.13 and Linux 3.12 print the same 187 lines.
+3.9, 3.12 and 3.13 and Linux 3.12 print the same 269 lines.
 
 ## Install
 
@@ -98,14 +110,24 @@ Several services: repeat `--service`. They stop in the order given and start in 
 python svcguard.py --server-url https://gis.example.org/server --service Parcels.MapServer --service Parcels_Locator.GeocodeServer --service Parcels_Edit.FeatureServer --command "python rebuild_locator.py" --apply
 ```
 
-Without `--apply` you get the plan and exit 0, having made zero HTTP calls. The plan prints the
-stop order and the start order.
+Without `--apply` you get the plan and make zero HTTP calls. The plan prints the stop order and
+the start order. It exits 0, except when `--list-file` shows a shrunk list: the dry run then prints
+`WOULD REFUSE` and exits 1, the exit the real run would give.
+
+Check the machine names and keep a list of the services a window guards:
+
+```
+python svcguard.py --server-url https://gis.example.org/server --service Parcels.MapServer --service Parcels_Locator.GeocodeServer --node gis-a.example.org --list-file /var/lib/svcguard/window.json --command "python rebuild_locator.py" --apply
+```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--server-url URL` | required | Admin REST base, e.g. `https://gis.example.org/server`. A URL with no `http://` or `https://`, no host, or a user name in it is a usage error. An `http://` URL is accepted with a warning in the log |
 | `--service NAME.TYPE` | required, repeatable | e.g. `Parcels.MapServer`. A missing dot, a space or other odd character, or the same service twice, is a usage error |
 | `--command CMD` | required | Maintenance command, run only while every service is confirmed stopped. A blank command is a usage error |
+| `--node NAME` | none, repeatable | A machine name the site must list, matched in full and without regard to case (a short host name does not match a fully qualified one). A name the site does not list refuses the run before any stop, exit 1. This is a check, not a filter: svcguard stops through the site endpoint, so every machine still stops and starts, and a machine the site has that no `--node` names is only warned about |
+| `--list-file PATH` | none | JSON file that keeps the service names a run guards. A later run whose list dropped a service is refused, exit 1. Written only with `--apply`, and only after the command ran |
+| `--allow-shrink` | off | Accept a shorter list than the saved one. Needs `--list-file` |
 | `--apply` | off | Actually talk to the server. Without it, zero HTTP calls happen |
 | `--user USER` | env, else prompt | Admin user |
 | `--timeout N` | 120 | Seconds for each service to reach `STOPPED` or `STARTED`. 1 or more |
@@ -122,10 +144,10 @@ command ran and failed.
 | Exit | Meaning |
 |---|---|
 | 0 | Every service stopped, the command succeeded, every service started |
-| 1 | The command was refused: a service never confirmed `STOPPED`, or the login or the server failed before the first stop. Every start that was needed succeeded |
+| 1 | The command was refused: a service never confirmed `STOPPED`, the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded |
 | 2 | The command failed or could not run. Every start succeeded |
 | 3 | At least one service could not be started again. Look now |
-| 64 | Usage or setup error: a bad flag or value, no credentials and no terminal to ask, or a log directory that cannot be written. Nothing was contacted |
+| 64 | Usage or setup error: a bad flag or value, no credentials and no terminal to ask, a log directory that cannot be written, or a saved list that cannot be read or written. Nothing was contacted |
 
 A failed start outranks everything else, so a run that refused the command and also left a
 service down exits 3, not 1.
@@ -155,6 +177,30 @@ to 129), and a token failure on one start (130 to 132). A single `--service` run
 start, poll and nothing else, as it did before several services existed (133). A stop phase
 that fails on the first of three still reports "1 of 3" (134). A refused login and a failed
 stop token send no start (66 to 69), and neither does an unreachable server (173).
+
+## Node names and the saved list
+
+**A mistyped node is refused, never widened.** With `--node`, svcguard logs in, then sends one
+GET to the site machines resource, documented on the Esri
+[`machines`](https://developers.arcgis.com/rest/enterprise-administration/server/machines/)
+page. That page lists GET as the only operation and names each machine under `machineName`.
+If a `--node` is not in that list, or the reply cannot be read, the run exits 1 before any stop.
+It does not fall back to "all nodes". Assertions 212 and 213 cover the mistyped name and show
+that no stop, start or status request follows it.
+
+**A shrunk list is refused.** A maintenance window grows by hand: someone adds a service,
+someone else drops one while editing the command line, and the dropped service is no longer
+stopped before the command or started after it. With `--list-file`, each run compares its own
+services with the saved ones, without regard to case. A service that dropped out is refused
+with exit 1 (assertions 226 and 252) unless `--allow-shrink` says it was deliberate. A swap, one
+service added and one dropped, counts as a shrink. A file that exists but is not a svcguard list
+exits 64 and is never read as "no list" (232 to 238, 260).
+
+**The list moves only after the command ran.** svcguard stages the new list beside the old one
+and replaces the old one only when the run ends in exit 0 or 2. A run refused at the login or the
+node check, or one with a failed start, leaves the saved list as it was (256 to 258). Otherwise a
+failed `--allow-shrink` run would store the short list and hide the shrink from the next run. A
+dry run never writes the file (242).
 
 ## Configuration
 
@@ -285,8 +331,36 @@ backoffs.
 - **The stub is not a server.** The self-test's admin API keeps one state per service and
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
-- **One branch is never taken.** The self-test covers every statement and every branch but
-  one: the false arc of `if __name__ == "__main__":`. Run as a script, that test is always true.
+- **One branch is not taken.** Coverage is 99 percent: 0 missed statements and 1 partial
+  branch of 212, the false arc of `if __name__ == "__main__":`. Only a second process that
+  imports the file reaches it. The self-test runs the file as a script, so it is always true there.
+- **`--node` is a check, not a filter.** A valid partial `--node` still stops and starts the
+  services across every machine of the site, and only logs a warning about the machines it did
+  not name.
+- **The `--node` check puts the token in a URL.** It sends the short-lived admin token as a
+  query parameter on one GET request, so it can appear in the access log of the server or any
+  proxy on the path. svcguard's own log and output never carry it.
+- **A redirected machine list is read from the redirect target.** `--node` trusts whatever
+  address the server redirects to. A redirect may point at another host, and no password or
+  token is sent there.
+- **A `--node` name must match exactly.** The comparison ignores case only. A short host name
+  does not match a fully qualified one, so the run is refused and you must type the listed name.
+- **The saved list stores service names only.** A service that moved to another folder or type
+  shows as one removed and one added, and the shrink is refused until you pass `--allow-shrink`.
+  Two `--service` names that differ only in case are not caught as a repeat.
+- **The saved list guards drift only while the file survives.** Deleting or moving it makes the
+  next run a first run, and a shrink is not reported.
+- **Give `--list-file` an absolute path.** A relative path resolves against the working directory
+  of the scheduler. If that changes between runs, the run reads no list, counts as the first,
+  and writes a new file, which hides a shrink.
+- **The saved list records what the run intended, once the command ran.** It holds the services
+  this run named, not proof that each was guarded. A crash while saving can leave a stray `.tmp`
+  file beside it.
+- **Exit 1 has two causes.** It covers both a refusal on a finding (an unknown `--node`, a shrunk
+  list, a service that never reached `STOPPED`) and a login or server that failed. Read the log
+  line before it.
+- **Ctrl-C is not turned into an exit code.** The `finally` block still starts the services,
+  but the interrupt then leaves as a traceback, with an exit status outside the documented set.
 - **A restart does not prove the data is current.** svcguard proves the services are up again.
   It does not prove that the rebuilt artifact matches its source. Usually you compare a
   last-edited timestamp, but a source layer without editor tracking has none. Checking derived
