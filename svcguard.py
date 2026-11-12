@@ -40,6 +40,8 @@ EXIT CODES
         list shrank; every start that was needed succeeded
     2   command failed (non-zero or raised); restarts succeeded
     3   at least one service could not be started again. A human needs to look now
+   4   the run finished clean (it would have been 0) but the saved list could not be
+       updated, so the next run compares against a stale list
    64   usage or setup error: a bad flag, a bad value, no credentials, an unwritable
         log directory, an unreadable or unwritable saved list. Nothing was contacted
 """
@@ -132,7 +134,11 @@ def _scrub(text, data):
     """
     for key, value in data.items():
         if key.lower() in _SECRET_KEYS and value:
-            for form in (str(value), urllib.parse.quote_plus(str(value))):
+            raw = str(value)
+            # Longest first: %20-for-space is the other common URL encoding (quote), and
+            # the safe="" forms also encode "/".
+            for form in (raw, urllib.parse.quote_plus(raw), urllib.parse.quote(raw, safe=""),
+                         urllib.parse.quote(raw)):
                 text = text.replace(form, "***REDACTED***")
     return text
 
@@ -777,29 +783,33 @@ def _resolve_password():
 
 
 def _settle_list(path, code):
-    """Commit the staged list only when the command ran (exit 0 or 2).
+    """Commit the staged list only when the command ran (exit 0 or 2). Return the exit code.
 
     A run refused before the command (unknown node, failed login, a stop that never
-    confirmed) or one with a failed start must not move the baseline.
+    confirmed) or one with a failed start must not move the baseline. A clean run whose
+    list cannot be saved returns 4: exit 0 would hide that the baseline is stale, so the
+    next run could miss a dropped service. Exit 2 is already non-zero and is kept.
     """
     if code in (0, 2):
         try:
             commit_list(path)
         except OSError as exc:
-            # The command already ran. Keep its exit code: a locked or read-only list file
-            # must not turn a finished maintenance run into a "refused" exit 1.
+            # The command already ran and the services are back. Exit 4, not 1: nothing was
+            # refused, but a clean exit 0 would leave a stale baseline unreported.
             log.error("the run finished but the saved list %s was not updated: %s", path, exc)
             try:
                 os.remove(path + ".tmp")
             except OSError as rm_exc:
                 log.warning("cannot remove %s.tmp: %s", path, rm_exc)
-        return
+            return 4 if code == 0 else code
+        return code
     log.warning("saved list not updated: the run ended with exit %d before it finished "
                 "guarding", code)
     try:
         os.remove(path + ".tmp")
     except OSError as exc:
         log.warning("cannot remove %s.tmp: %s", path, exc)
+    return code
 
 
 def main(argv=None):
@@ -902,7 +912,7 @@ def main(argv=None):
         code = guard(args.server_url, services, args.command, username, password,
                      args.insecure, args.retries, args.timeout, nodes)
         if staged:
-            _settle_list(args.list_file, code)
+            code = _settle_list(args.list_file, code)
     finally:
         log.info("svcguard finished. Log: %s", log_path)
         _close_logging()
@@ -1995,6 +2005,13 @@ def self_test():
             check("T0K" not in _scrub("a T0K/EN+x=9 b T0K%2FEN%2Bx%3D9 c", {"token": secret})
                   and _scrub("keep", {"token": secret, "f": "json"}) == "keep",
                   "_scrub masks a token in its raw and its form-encoded spelling")
+            pw_odd = "P@ss w&rd+1%/x"
+            check("w&rd" not in _scrub("a P@ss w&rd+1%/x b P%40ss+w%26rd%2B1%25%2Fx c "
+                                       "P%40ss%20w%26rd%2B1%25%2Fx d P%40ss%20w%26rd%2B1%25/x",
+                                       {"password": pw_odd})
+                  and "%2B1" not in _scrub("P%40ss%20w%26rd%2B1%25%2Fx", {"password": pw_odd}),
+                  "_scrub masks a password in its %20 and slash-kept percent spellings too"
+                  "  <-- pinned defect")
             check(_scrub("json", {"f": "json"}) == "json" and _scrub("x", {"token": ""}) == "x",
                   "_scrub leaves a form with no secret alone")
             echoed = {"error": {"code": 500, "message": "failed for /m?token=T0K%2FEN%2Bx%3D9&f=json"},
@@ -2291,7 +2308,9 @@ def self_test():
             _settle_list(os.path.join(work, "no-such.json"), 1)
             check(not os.path.exists(os.path.join(work, "no-such.json")),
                   "settling a failed run with no temp file left only warns")
-            check(_settle_list(os.path.join(work, "no-such.json"), 0) is None
+            check(_settle_list(os.path.join(work, "no-such.json"), 2) == 2,
+                  "a failed-command run whose list cannot be saved keeps exit 2")
+            check(_settle_list(os.path.join(work, "no-such.json"), 0) == 4
                   and not os.path.exists(os.path.join(work, "no-such.json")),
                   "settling a finished run whose temp file vanished only logs the error")
 
@@ -2320,9 +2339,10 @@ def self_test():
                                                   "locked")
             finally:
                 module.commit_list = real_commit
-            check(code == 0 and ran_it and "was not updated" in err
+            check(code == 4 and ran_it and "was not updated" in err
                   and not os.path.exists(lst) and not os.path.exists(lst + ".tmp"),
-                  "a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect")
+                  "a clean run whose saved list cannot be replaced exits 4, not 0"
+                  "  <-- pinned defect")
 
             # A grown list that ends in a refusal or a failed start must not move the baseline.
             for extra, kwargs, want, label in (

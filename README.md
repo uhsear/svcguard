@@ -56,40 +56,42 @@ PASS 175  an unwritable log directory exits 64 before any service is touched  <-
 ...
 PASS 181  a reply cut short is retried, not read as a failed start  <-- pinned defect
 ...
-PASS 213  an admin token echoed in a reply body reaches neither the exception nor the debug log  <-- pinned defect
+PASS 210  _scrub masks a password in its %20 and slash-kept percent spellings too  <-- pinned defect
 ...
-PASS 221  a mistyped --node refuses the run instead of using every node  <-- pinned defect
+PASS 214  an admin token echoed in a reply body reaches neither the exception nor the debug log  <-- pinned defect
 ...
-PASS 227  a redirected machine list refuses the run and the token goes nowhere else  <-- pinned defect
+PASS 222  a mistyped --node refuses the run instead of using every node  <-- pinned defect
 ...
-PASS 236  a shorter list is refused and the note names the dropped service  <-- pinned defect
+PASS 228  a redirected machine list refuses the run and the token goes nowhere else  <-- pinned defect
 ...
-PASS 262  a refused shrink leaves the saved list as it was  <-- pinned defect
+PASS 237  a shorter list is refused and the note names the dropped service  <-- pinned defect
 ...
-PASS 266  the saved list is unchanged after --allow-shrink on a run whose login fails  <-- pinned defect
-PASS 267  the saved list is unchanged after a growing list on a run whose login fails  <-- pinned defect
-PASS 268  a first run that never logs in saves no list  <-- pinned defect
+PASS 263  a refused shrink leaves the saved list as it was  <-- pinned defect
 ...
-PASS 273  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
-PASS 274  a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect
+PASS 267  the saved list is unchanged after --allow-shrink on a run whose login fails  <-- pinned defect
+PASS 268  the saved list is unchanged after a growing list on a run whose login fails  <-- pinned defect
+PASS 269  a first run that never logs in saves no list  <-- pinned defect
 ...
-PASS 284  a stop the server refused is not started, and exits 1 not 3  <-- pinned defect
+PASS 275  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
+PASS 276  a clean run whose saved list cannot be replaced exits 4, not 0  <-- pinned defect
 ...
-PASS 286  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
-PASS 287  with no stdin the user-name prompt reads as blank  <-- pinned defect
-PASS 288  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
-PASS 289  importing the file runs no main()
+PASS 286  a stop the server refused is not started, and exits 1 not 3  <-- pinned defect
+...
+PASS 288  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
+PASS 289  with no stdin the user-name prompt reads as blank  <-- pinned defect
+PASS 290  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
+PASS 291  importing the file runs no main()
 ------------------------------------------------------------
-289 assertions, 0 failed
+291 assertions, 0 failed
 ```
 
-The full run prints all 289 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 291 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
 took 10 to 15 seconds on Windows with Python 3.9, 3.12 or 3.13 and about 4 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9, 3.12 and 3.13 and Linux 3.12 print the same 289 lines.
+3.9, 3.12 and 3.13 and Linux 3.12 print the same 291 lines.
 
 ## Install
 
@@ -161,6 +163,7 @@ command ran and failed.
 | 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded |
 | 2 | The command failed or could not run. Every start succeeded |
 | 3 | At least one service could not be started again. Look now |
+| 4 | The run finished clean (it would have been 0) but the saved list could not be updated, so the next run compares against a stale list. Every service is running again |
 | 64 | Usage or setup error: a bad flag or value, no credentials and no terminal to ask, a log directory that cannot be written, or a saved list that cannot be read or written. Nothing was contacted |
 
 A failed start outranks everything else, so a run that refused the command and also left a
@@ -189,7 +192,7 @@ service down exits 3, not 1.
    of configured services. The run exits 3.
 
 The self-test drives each of these rules against the stub server: a refused start of the
-middle service (assertions 115 to 124), a stop that never lands on the second of three (125
+middle service (assertions 115 to 123), a stop that never lands on the second of three (125
 to 129), and a token failure on one start (130 to 132). A single `--service` runs stop, poll,
 start, poll and nothing else, as it did before several services existed (133). A stop phase
 that fails on the first of three still reports "1 of 3" (134). A refused login and a failed
@@ -213,7 +216,7 @@ that no stop, start or status request follows it.
 someone else drops one while editing the command line, and the dropped service is no longer
 stopped before the command or started after it. With `--list-file`, each run compares its own
 services with the saved ones, without regard to case. A service that dropped out is refused
-with exit 1 (assertions 236 and 262) unless `--allow-shrink` says it was deliberate. A swap, one
+with exit 1 (assertions 237 and 263) unless `--allow-shrink` says it was deliberate. A swap, one
 service added and one dropped, counts as a shrink. A file that exists but is not a svcguard list
 exits 64 and is never read as "no list" (242 to 248, 271).
 
@@ -244,14 +247,14 @@ passed through a redactor before it reaches the DEBUG log file, because the `gen
 response body is itself the secret. Three assertions read the log file back to prove the
 token is absent and the redaction marker is present (97 to 99). A fourth checks that the
 polled states were logged at all (100). A fifth (140) reads the log of a full `--apply` run
-over HTTP and finds neither the token nor the password. A sixth (213) has a server echo the
+over HTTP and finds neither the token nor the password. A sixth (214) has a server echo the
 request target, token included, inside an error body, and finds the token in neither the
 exception nor the log: svcguard also masks the secrets it sent wherever a reply repeats them.
 
 A bad `--server-url` is caught before any request leaves: no scheme, no host, or credentials
 typed into the URL (they would reach the log and the error messages). With no terminal and no
 credentials in the environment, a scheduled run exits 64 with one line, not a traceback. That
-includes a process with no stdin at all (assertions 287 and 288, the second a real child
+includes a process with no stdin at all (assertions 289 and 290, the second a real child
 process). svcguard prompts for the user name and the password only when stdin is a console.
 Before this check, the user-name prompt read a piped line as the name, blocked on an open pipe,
 and crashed with a `RuntimeError` when stdin was closed. On Windows `os.isatty()` also
@@ -346,7 +349,7 @@ backoffs.
 - **A killed svcguard restarts nothing.** SIGTERM, SIGKILL, `TerminateProcess` and power loss
   skip the `finally` block. The guarantee covers a failing command, not a killed tool.
 - **A second interrupt abandons the starts that have not run.** Ctrl-C during the command is
-  covered. A further Ctrl-C during the start phase is not caught.
+  covered (checked by a monkeypatched run, not by a self-test assertion; see below). A further Ctrl-C during the start phase is not caught.
 - **Exit 3 means "could not confirm".** A server that becomes unreachable during the command
   gives exit 3, although the services may be fine. Check the log before you restart anything.
 - **A start sent to a running service is assumed to succeed.** This happens after a stop that
@@ -357,7 +360,7 @@ backoffs.
 - **The command text is logged.** `--command` appears in the dry run, on the console and in the
   log file. Keep passwords out of it, for example a `sqlcmd -P` flag.
 - **A redirected POST is refused.** A 301, 302 or 303 reply to the login, a stop, a start or a
-  status request is an exit 1 refusal and svcguard contacts no other host (assertion 286).
+  status request is an exit 1 refusal and svcguard contacts no other host (assertion 288).
   Before this check urllib sent a body-less GET to the new address and svcguard believed its
   JSON. Give the final URL, for example the one behind a load balancer that redirects http to
   https.
@@ -377,19 +380,34 @@ backoffs.
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
 - **Coverage is 100 percent.** The self-test imports the file once under another module name
-  (assertion 289) to reach the false arc of `if __name__ == "__main__":`.
+  (assertion 291) to reach the false arc of `if __name__ == "__main__":`.
 - **The saved list can fail to update after a good run.** If the command ran but the saved list
   cannot be replaced, for example because another program holds the file open, svcguard logs an
-  error and keeps the run's own exit code (assertion 274). The next run compares against the
-  old list.
+  error and exits 4 instead of 0 (assertion 276), so a scheduler sees that the baseline is
+  stale. A run that already exits 2 keeps 2. The next run compares against the old list, and
+  a service dropped in between is not reported until a run replaces the list. Run once by hand
+  after exit 4.
 - **A dry run does not test the saved list path.** With `--list-file` in a directory that does
   not exist, the dry run says the list will be saved and exits 0. The real run then exits 64.
 - **Ctrl-C can leave `PATH.tmp` behind.** An interrupt after the list is staged ends with a
   traceback and a stray temporary file next to the saved list. The saved list itself is intact.
 - **Secrets are masked by key name, and by value for what svcguard sent.** svcguard masks
   values under the keys `token`, `password`, `passwd`, `secret` and `credentials`. It also masks
-  the token or password it sent when a reply repeats it in any string (assertions 211 to 213).
+  the token or password it sent when a reply repeats it in any string, as plain text or in a
+  percent-encoded form (`+` or `%20` for a space, with `/` encoded or kept; assertions 209 to
+  214). Another encoding of a repeated secret, such as HTML escaping, is not masked.
   A different secret that a server invents and puts under another key is not masked.
+- **An empty service type passes validation.** A `--service` value such as `x.` has a dot and
+  allowed characters, so svcguard sends it. The server refuses it (exit 1). svcguard does not
+  check that the type is a real service type.
+- **A non-numeric port passes validation.** `--server-url https://h:abc/server` has a scheme,
+  a host and no credentials. It fails at the first request (exit 1, nothing stopped).
+- **`--node` is a check, not a filter.** `--node gis-a` does not stop only that machine. The
+  services still stop for the whole site.
+- **The 404 for a mistyped service name is the stub's reply.** The Esri
+  [`stopService`](https://developers.arcgis.com/rest/enterprise-administration/server/stopservice/)
+  page does not document the status for an unknown name. svcguard treats any 4xx as a refused
+  stop; the 404 in the self-test is an assumption about a real server.
 - **A console that cannot encode `--command` can break the dry run.** The dry run prints the
   command with `%r`. A character the console code page cannot encode may raise an error there.
   The dry run writes nothing.
@@ -400,9 +418,11 @@ backoffs.
   "--node not in this site", names the real cause.
 - **The Ctrl-C start-up behaviour was checked by hand, not by the self-test.** On Linux with
   Python 3.12 against a local stub, Ctrl-C during the command started the services again and
-  then left the traceback. A later audit could not reproduce this: its Linux attempt ignored
-  SIGINT, because background jobs of a non-interactive shell start with SIGINT ignored. Treat
-  the claim as unconfirmed.
+  then left the traceback. A later audit could not reproduce this with a real signal: its Linux
+  attempt ignored SIGINT, because background jobs of a non-interactive shell start with SIGINT
+  ignored. A second audit drove the guard with a command that raises `KeyboardInterrupt`
+  (a monkeypatched run). Both services were started again, the interrupt propagated, and a
+  stray `PATH.tmp` stayed. A real Ctrl-C on a console is still unconfirmed.
 - **TLS is tested on the SSL context only.** Assertions 15 to 18 check the context object that
   `--insecure` changes. The whole self-test runs over plain `http://` on `127.0.0.1`, so no real
   TLS handshake or certificate check is exercised.
