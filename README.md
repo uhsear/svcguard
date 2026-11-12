@@ -166,7 +166,7 @@ assertions 95 to 97 cover a separate value, a `--name=value` pair and a short fl
 | Exit | Meaning |
 |---|---|
 | 0 | Every service stopped, the command succeeded, every service started |
-| 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded. The one exception is a service whose stop and start the server both refused: it is not counted as down when a status call shows it `STARTED` or answers 404 (an HTTP 404, or code 404 in the reply body) for the name. Every other answer from that call, such as a 403 or an invalid-token body, leaves the state unread and the run exits 3 |
+| 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded. The one exception is a service whose stop the server refused and whose start then failed: it is not counted as down when a status call shows it `STARTED` or answers 404 (an HTTP 404, or code 404 in the reply body) for the name. Every other answer from that call, such as a 403 or an invalid-token body, leaves the state unread and the run exits 3 |
 | 2 | The command failed or could not run. Every start succeeded |
 | 3 | At least one service could not be started again. Look now |
 | 4 | The run finished clean (it would have been 0) but the saved list could not be updated, so the next run compares against a stale list. Every service is running again |
@@ -174,7 +174,7 @@ assertions 95 to 97 cover a separate value, a `--name=value` pair and a short fl
 
 A failed start outranks everything else, so a run that refused the command and also left a
 service down exits 3, not 1. That includes a service whose stop the server refused and whose
-start it refused too, unless a status call shows it `STARTED` or answers 404 for the name. If
+start then failed, unless a status call shows it `STARTED` or answers 404 for the name. If
 that status call cannot be read, or answers with any other refusal (a 403, an invalid-token body,
 a server that is still starting), the run exits 3, because svcguard cannot tell that the
 service is up. Assertions 296 to 301 cover each case.
@@ -269,7 +269,7 @@ exception nor the log: svcguard also masks the secrets it sent wherever a reply 
 A bad `--server-url` is caught before any request leaves: no scheme, no host, or credentials
 typed into the URL (they would reach the log and the error messages). With no terminal and no
 credentials in the environment, a scheduled run exits 64 with one line, not a traceback. That
-includes a process with no stdin at all (assertions 298 and 299, the second a real child
+includes a process with no stdin at all (assertions 303 and 304, the second a real child
 process). svcguard prompts for the user name and the password only when stdin is a console.
 Before this check, the user-name prompt read a piped line as the name, blocked on an open pipe,
 and crashed with a `RuntimeError` when stdin was closed. On Windows `os.isatty()` also
@@ -304,7 +304,7 @@ choice.
   services to come up.
 - The ArcGIS API for Python wraps the same endpoints as
   [`Service.start()` and `Service.stop()`](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.server.html),
-  each documented with a `bool` return type. A loop over several services can check each result
+  each declared with a `bool` return type. A loop over several services can check each result
   and carry on to the next.
 
 Neither one runs a command between the stop and the start, or refuses that command when a stop
@@ -340,7 +340,7 @@ service published from ArcMap, which cannot start after an upgrade to ArcGIS Ent
 reads that refusal as a completed start. svcguard whitelists `success`: any other status, and
 any body carrying an `error` key, is a failure. The stub server answers a refused start with
 that documented body. Retries cover transport faults, 429 and 5xx only. A 401, 403 or 404 is a
-permanent refusal and is not retried, because retrying it only delays the page by three
+permanent refusal and is not retried, because retrying it only delays the page by two
 backoffs.
 
 ## Limitations
@@ -375,7 +375,7 @@ backoffs.
 - **The command text is logged.** `--command` appears in the dry run, on the console and in the
   log file. Keep passwords out of it, for example a `sqlcmd -P` flag.
 - **A redirected POST is refused.** A 301, 302 or 303 reply to the login, a stop, a start or a
-  status request is an exit 1 refusal and svcguard contacts no other host (assertion 297).
+  status request is an exit 1 refusal and svcguard contacts no other host (assertion 302).
   Before this check urllib sent a body-less GET to the new address and svcguard believed its
   JSON. Give the final URL, for example the one behind a load balancer that redirects http to
   https.
@@ -395,7 +395,7 @@ backoffs.
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
 - **Coverage is 100 percent.** The self-test imports the file once under another module name
-  (assertion 300) to reach the false arc of `if __name__ == "__main__":`.
+  (assertion 305) to reach the false arc of `if __name__ == "__main__":`.
 - **The saved list can fail to update after a good run.** If the command ran but the saved list
   cannot be replaced, for example because another program holds the file open, svcguard logs an
   error and exits 4 instead of 0 (assertion 281), so a scheduler sees that the baseline is
@@ -501,11 +501,32 @@ backoffs.
   whether the cause was the server or the request, so read the log.
 - **Ctrl-C is not turned into an exit code.** The `finally` block still starts the services,
   but the interrupt then leaves as a traceback, with an exit status outside the documented set.
-- **Two Esri behaviours are not verified against official documentation.** The `client` value
-  `requestip` in the token request ties the token to the caller's IP address, so a site reached
-  through changing NAT addresses may reject later calls. The claim that another program holding
-  the saved list open makes `os.replace` fail on Windows is also unverified; assertion 281
-  simulates the failure.
+- **One Esri behaviour is not verified against official documentation.** The claim that another
+  program holding the saved list open makes `os.replace` fail on Windows is unverified;
+  assertion 281 simulates the failure. The `client` value `requestip` in the token request is
+  documented: the
+  [`generateToken`](https://developers.arcgis.com/rest/enterprise-administration/server/generatetoken/)
+  page says the IP address the request came from is used. A site reached through changing NAT
+  addresses may therefore reject later calls.
+- **The status call is a POST, but Esri documents only GET.** The
+  [status page](https://developers.arcgis.com/rest/enterprise-administration/server/service-status/)
+  lists the method `GET` for the status resource, and svcguard sends a POST. This was not tested
+  against a real server. A server that rejected the POST would make every stop read as
+  unconfirmed, so the run would refuse the command.
+- **A valid `--node` does not narrow the run to that machine.** Every machine of the site still
+  stops and starts.
+- **Hidden values cover one error message only.** svcguard hides a mistyped value in the
+  "unrecognized arguments" error. A value attached to a valid flag is echoed by argparse, for
+  example `--apply=value` or `--timeout=value`.
+- **A password that occurs inside the issued token corrupts the token.** svcguard masks the
+  password wherever a reply repeats it, so the token itself is rewritten. Every later call then
+  fails with an invalid-token error and the run exits 1 or 3, never 0. Use a longer password.
+- **The log trusts the text of server replies.** A `realTimeState` string is written to the log
+  as received, and svcguard does not strip line breaks from it, so a hostile or broken server
+  could forge log lines.
+- **svcguard does not restrict log file permissions.** The log files and the saved list `.tmp`
+  file use the default umask, so on Linux other local users may read them. The logs hold the
+  `--command` text and the service names.
 - **Transport-error text is not scrubbed.** The message from a connection error is logged as the
   operating system gave it, without the masking that reply bodies get. No input in the audits put
   a token or password there, but nothing guarantees it.
