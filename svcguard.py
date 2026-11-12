@@ -12,10 +12,10 @@ SEVERAL SERVICES
 NODE NAMES
     --node NAME (repeatable) names machines the site must list. svcguard stops a
     service through the site endpoint and cannot aim at one machine, so --node is a
-    check, not a filter: every machine of the site still stops and starts. A name the site does not list refuses the
-    run before any stop (exit 1); it never falls through to "all nodes". Machines
-    the site has and --node does not name are warned about. Without --node, no
-    machine call is made.
+    check, not a filter: every machine of the site still stops and starts. A name the
+    site does not list refuses the run before any stop (exit 1); it never falls
+    through to "all nodes". Machines the site has and --node does not name are
+    warned about. Without --node, no machine call is made.
 
 SAVED LIST
     --list-file PATH keeps the services a run guards. The next run compares its own
@@ -37,7 +37,8 @@ EXIT CODES
     0   every service stopped, command succeeded, every service started
     1   the command was REFUSED: a service never reached STOPPED, the login or the
         server failed before the first stop, a --node is not in the site, or the saved
-        list shrank; every start that was needed succeeded
+        list shrank; every start that was needed succeeded, or failed for a service whose
+        stop the server refused and that reads as running or unknown to the server
     2   command failed (non-zero or raised); restarts succeeded
     3   at least one service could not be started again. A human needs to look now
    4   the run finished clean (it would have been 0) but the saved list could not be
@@ -550,13 +551,34 @@ def exit_code(all_stopped, command_rc, failed_starts):
     return 0
 
 
-def _start_one(server_url, service, username, password, insecure, retries, timeout):
+def _needs_no_attention(server_url, service, token, insecure, retries):
+    """After a failed start of a service whose stop was refused: is it safe to say so?
+
+    True when the status call says the service is STARTED or that the server has no
+    such service (a mistyped name). False when the service reads as anything else or
+    the status could not be read, because then the tool cannot tell it is up. Never raises.
+    """
+    try:
+        state = get_service_state(server_url, service, token, insecure, retries)
+    except ServerRefused:
+        return True
+    except Exception as exc:
+        log.error("%s: its state could not be read after the failed start: %s", service, exc)
+        return False
+    return state == "STARTED"
+
+
+def _start_one(server_url, service, username, password, insecure, retries, timeout,
+               refused=False):
     """Start one service. Never raises, so one failed start cannot skip the next.
+    Returns True when the service is started, or, for a service whose stop the server
+    refused (refused=True), when a status call shows it running or unknown to the server.
 
     Each start gets a FRESH token: the stop-phase token may have expired during a
     long command, it may never have existed if the stop phase's own token call
     threw, and a token failure here must cost this service only.
     """
+    token = None
     try:
         log.info("Requesting FRESH token to start %s ...", service)
         token = get_token(server_url, username, password, insecure, retries)
@@ -567,7 +589,8 @@ def _start_one(server_url, service, username, password, insecure, retries, timeo
         return True
     except Exception as exc:
         log.critical("RESTART FAILED, %s may be down: %s", service, exc)
-        return False
+        return (refused and token is not None
+                and _needs_no_attention(server_url, service, token, insecure, retries))
 
 
 def guard(server_url, services, command, username, password, insecure, retries, timeout,
@@ -598,9 +621,9 @@ def guard(server_url, services, command, username, password, insecure, retries, 
                 except ServerRefused:
                     # A refusal does not prove nothing stopped: a timed-out first attempt
                     # can stop the service and the retry then gets an error body. So a
-                    # start is still sent (starting a started service is harmless), but
-                    # its failure is not counted as a down service: a mistyped name
-                    # would otherwise exit 3.
+                    # start is still sent (starting a started service is harmless). If
+                    # that start fails too, a status call decides: a running service or a
+                    # name the server does not know exits 1, anything else exits 3.
                     refused = service
                     log.error("%s: the server refused the stop; a start is still sent in "
                               "case the stop took effect first", service)
@@ -628,8 +651,8 @@ def guard(server_url, services, command, username, password, insecure, retries, 
             )
     finally:
         for service in restart_order(services, reached):
-            if (not _start_one(server_url, service, username, password, insecure, retries,
-                               timeout) and service != refused):
+            if not _start_one(server_url, service, username, password, insecure, retries,
+                              timeout, refused=(service == refused)):
                 failed.append(service)
         if failed:
             log.critical("%d of %d service(s) are NOT running: %s",
@@ -1152,6 +1175,8 @@ class _StubAdmin(object):
         if op == "status" and self.cut_status > 0:
             self.cut_status -= 1
             return self.CUT
+        if op == "status" and service not in self.state:
+            return {"error": {"code": 404, "message": "service not found"}}
         if op == "status":
             return {"configuredState": self.state[service], "realTimeState": self.state[service]}
         if op == "stop" and service in self.refuse_stop:
@@ -2435,7 +2460,7 @@ def self_test():
             # ---- group V: refused stops, redirects, no stdin --------------
             # A stop the server refused is still followed by a start for that service,
             # because a retried stop can be refused after the first attempt took effect.
-            # A start that fails for it is not a down service, so a mistyped name exits 1.
+            # If that start fails too, a status call decides between exit 1 and exit 3.
             stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"])
             ran = []
             try:
@@ -2460,8 +2485,9 @@ def self_test():
             check(code == 1 and ran == [] and states["B.GeocodeServer"] == "STARTED"
                   and states["A.MapServer"] == "STARTED",
                   "a stop refused after it took effect leaves the service started  <-- pinned defect")
-            stub = _StubAdmin(["Parcels_Locater.GeocodeServer"],
-                              fail_start=["Parcels_Locater.GeocodeServer"],
+            # Both the stop and the start refused: a status call decides the verdict.
+            # A name the server does not know (a mistyped name) is a refusal, exit 1.
+            stub = _StubAdmin([], fail_start=["Parcels_Locater.GeocodeServer"],
                               refuse_stop=["Parcels_Locater.GeocodeServer"])
             try:
                 install(run=lambda cmd: ran.append(cmd) or 0)
@@ -2470,8 +2496,44 @@ def self_test():
             finally:
                 stub.close()
             check(code == 1 and ran == []
-                  and [op for op, _ in stub.ops] == ["stop", "start"],
-                  "a mistyped service name sends a refused stop and a refused start, and exits 1"
+                  and [op for op, _ in stub.ops] == ["stop", "start", "status"],
+                  "a mistyped service name sends a refused stop, a refused start and a "
+                  "status call, and exits 1  <-- pinned defect")
+            # The retried stop was refused after the first attempt took effect, and the
+            # start is refused too: the service is down, so the run exits 3, not 1.
+            stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"],
+                              fail_start=["B.GeocodeServer"])
+            stub.refuse_after_stop = True
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+                states = dict(stub.state)
+            finally:
+                stub.close()
+            check(code == 3 and ran == [] and states["B.GeocodeServer"] == "STOPPED"
+                  and states["A.MapServer"] == "STARTED",
+                  "a refused stop and a refused start on a service that is down exit 3, "
+                  "not 1  <-- pinned defect")
+            # A refused start on a service that reads STARTED needs no human: exit 1.
+            stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"],
+                              fail_start=["B.GeocodeServer"])
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 1 and ran == [],
+                  "a refused stop and a refused start on a service that reads STARTED exit 1")
+            # The status call itself cannot be read: the tool cannot tell, so exit 3.
+            stub = _StubAdmin(["B.GeocodeServer"], refuse_stop=["B.GeocodeServer"],
+                              fail_start=["B.GeocodeServer"], cut_status=3)
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, ["B.GeocodeServer"], "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 3 and ran == [],
+                  "a refused stop and a refused start with an unreadable status exit 3"
                   "  <-- pinned defect")
 
             # A 302 on a POST must not be followed: the second host answers the replayed
