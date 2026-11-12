@@ -533,8 +533,8 @@ def restart_order(services, reached):
     when none was sent. The stop phase halts at its first failure, so the services
     after it were never touched and are left exactly as they were. The one it failed
     on is started too: a stop that timed out can leave a service half down. A stop
-    the server refused outright changed nothing, so guard() does not count it as
-    reached. When no stop was sent, nothing was stopped and nothing is started.
+    the server refused is started too, because a retried stop can be refused after
+    the first attempt took effect. When no stop was sent, nothing is started.
     """
     return list(reversed(services[:reached + 1]))
 
@@ -578,6 +578,7 @@ def guard(server_url, services, command, username, password, insecure, retries, 
     """
     reached = -1      # index of the last service a stop was sent for; -1 = none yet
     stopping = None   # the service whose stop request is being sent, for the log
+    refused = None    # the service whose stop the server refused, if any
     all_stopped = False
     command_rc = None
     failed = []
@@ -595,11 +596,14 @@ def guard(server_url, services, command, username, password, insecure, retries, 
                 try:
                     manage_service(server_url, service, token, "stop", insecure, retries)
                 except ServerRefused:
-                    # Refused outright (a mistyped name, a 4xx, an error body): nothing
-                    # stopped, so a start would only repeat the refusal and exit 3.
-                    reached = index - 1
-                    log.error("%s: the server refused the stop, so no start is sent for it",
-                              service)
+                    # A refusal does not prove nothing stopped: a timed-out first attempt
+                    # can stop the service and the retry then gets an error body. So a
+                    # start is still sent (starting a started service is harmless), but
+                    # its failure is not counted as a down service: a mistyped name
+                    # would otherwise exit 3.
+                    refused = service
+                    log.error("%s: the server refused the stop; a start is still sent in "
+                              "case the stop took effect first", service)
                     raise
                 wait_for_state(server_url, service, token, "STOPPED", insecure, retries,
                                timeout)
@@ -624,8 +628,8 @@ def guard(server_url, services, command, username, password, insecure, retries, 
             )
     finally:
         for service in restart_order(services, reached):
-            if not _start_one(server_url, service, username, password, insecure, retries,
-                              timeout):
+            if (not _start_one(server_url, service, username, password, insecure, retries,
+                               timeout) and service != refused):
                 failed.append(service)
         if failed:
             log.critical("%d of %d service(s) are NOT running: %s",
@@ -643,7 +647,24 @@ class _Parser(argparse.ArgumentParser):
 
     def error(self, message):
         self.print_usage(sys.stderr)
-        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+        self.exit(64, "%s: error: %s\n" % (self.prog, hide_unrecognized(message)))
+
+
+def hide_unrecognized(message):
+    """Keep only flag names in argparse's 'unrecognized arguments' message. Pure.
+
+    A user who guesses a --password flag would otherwise see the secret printed to
+    stderr, where a scheduler stores it. A --name=value keeps --name; any other
+    token (a value, or a single-dash token) is hidden.
+    """
+    prefix = "unrecognized arguments: "
+    if not message.startswith(prefix):
+        return message
+    shown = []
+    for token in message[len(prefix):].split(" "):
+        name = token.split("=", 1)[0]
+        shown.append(name if name.startswith("--") and len(name) > 2 else "<hidden>")
+    return prefix + " ".join(shown)
 
 
 _SERVICE_CHARS = frozenset(
@@ -1054,6 +1075,7 @@ class _StubAdmin(object):
         self.fail_start = set(fail_start)
         self.never_stops = set(never_stops)
         self.refuse_stop = set(refuse_stop)
+        self.refuse_after_stop = False
         self.post_redirect = None
         self.cut_status = cut_status
         self.ops = []
@@ -1134,6 +1156,9 @@ class _StubAdmin(object):
             return {"configuredState": self.state[service], "realTimeState": self.state[service]}
         if op == "stop" and service in self.refuse_stop:
             # The shape of the error envelope the admin API sends for a name it lacks.
+            # refuse_after_stop plays a retry: the first attempt already took effect.
+            if self.refuse_after_stop:
+                self.state[service] = "STOPPED"
             return {"error": {"code": 404, "message": "service not found"}}
         if op == "start" and service in self.fail_start:
             # The documented shape of a start the server refuses.
@@ -1462,6 +1487,27 @@ def self_test():
         for action in build_parser()._actions:
             flags.update(action.option_strings)
         check("--password" not in flags, "there is no --password flag")
+        import io
+        for typed, how in ((["--password", "hunter2zz"], "a separate value"),
+                           (["--password=hunter2zz"], "a --name=value pair"),
+                           (["-p", "hunter2zz"], "a short flag")):
+            err = io.StringIO()
+            saved = sys.stderr
+            sys.stderr = err
+            try:
+                build_parser().parse_args(typed)
+            except SystemExit:
+                pass
+            finally:
+                sys.stderr = saved
+            check("hunter2zz" not in err.getvalue() and "unrecognized arguments" in err.getvalue(),
+                  "a password typed as flag %s is not echoed to stderr  <-- pinned defect" % how)
+        check(hide_unrecognized("unrecognized arguments: --a=1 b -c") ==
+              "unrecognized arguments: --a <hidden> <hidden>",
+              "hide_unrecognized keeps long flag names and hides every other token")
+        check(hide_unrecognized("argument --timeout: invalid int value: 'x'") ==
+              "argument --timeout: invalid int value: 'x'",
+              "hide_unrecognized leaves other parser messages as they are")
         check("--apply" in flags and "--insecure" in flags, "the documented flags exist")
         check(len(flags) == 14, "exactly 12 flags plus -h/--help are defined")
 
@@ -2387,8 +2433,9 @@ def self_test():
                 check(scratch.failed == 1, "raises() records %s" % what)
 
             # ---- group V: refused stops, redirects, no stdin --------------
-            # A stop the server refused outright changed nothing, so nothing is started
-            # for it. The old code started the name, got a second refusal and exited 3.
+            # A stop the server refused is still followed by a start for that service,
+            # because a retried stop can be refused after the first attempt took effect.
+            # A start that fails for it is not a down service, so a mistyped name exits 1.
             stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"])
             ran = []
             try:
@@ -2397,12 +2444,24 @@ def self_test():
             finally:
                 stub.close()
             check(code == 1 and ran == []
-                  and ("start", "B.GeocodeServer") not in stub.ops
+                  and ("start", "B.GeocodeServer") in stub.ops
                   and ("start", "C.FeatureServer") not in stub.ops
                   and ("start", "A.MapServer") in stub.ops,
-                  "a stop the server refused is not started, and exits 1 not 3"
+                  "a stop the server refused is still followed by a start, and exits 1 not 3"
                   "  <-- pinned defect")
+            stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"])
+            stub.refuse_after_stop = True
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+                states = dict(stub.state)
+            finally:
+                stub.close()
+            check(code == 1 and ran == [] and states["B.GeocodeServer"] == "STARTED"
+                  and states["A.MapServer"] == "STARTED",
+                  "a stop refused after it took effect leaves the service started  <-- pinned defect")
             stub = _StubAdmin(["Parcels_Locater.GeocodeServer"],
+                              fail_start=["Parcels_Locater.GeocodeServer"],
                               refuse_stop=["Parcels_Locater.GeocodeServer"])
             try:
                 install(run=lambda cmd: ran.append(cmd) or 0)
@@ -2410,8 +2469,9 @@ def self_test():
                              False, 3, 20)
             finally:
                 stub.close()
-            check(code == 1 and ran == [] and [op for op, _ in stub.ops] == ["stop"],
-                  "a mistyped service name sends one refused stop and nothing else"
+            check(code == 1 and ran == []
+                  and [op for op, _ in stub.ops] == ["stop", "start"],
+                  "a mistyped service name sends a refused stop and a refused start, and exits 1"
                   "  <-- pinned defect")
 
             # A 302 on a POST must not be followed: the second host answers the replayed
