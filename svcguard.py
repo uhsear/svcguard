@@ -10,9 +10,9 @@ SEVERAL SERVICES
     start never skips the starts after it. When no stop was sent, nothing is started.
 
 NODE NAMES
-    --node NAME (repeatable) states which machines of the site this run may touch.
-    svcguard stops a service through the site endpoint and cannot aim at one machine,
-    so --node is a check, not a filter. A name the site does not list refuses the
+    --node NAME (repeatable) names machines the site must list. svcguard stops a
+    service through the site endpoint and cannot aim at one machine, so --node is a
+    check, not a filter: every machine of the site still stops and starts. A name the site does not list refuses the
     run before any stop (exit 1); it never falls through to "all nodes". Machines
     the site has and --node does not name are warned about. Without --node, no
     machine call is made.
@@ -29,6 +29,7 @@ Stdlib only. Python 3.9+.
 CONFIG PRECEDENCE (identical to the README):
     user      --user           >  env ARCGIS_SERVER_USER      >  interactive getpass prompt
     password  (no flag exists) >  env ARCGIS_SERVER_PASSWORD  >  interactive getpass prompt
+                                                      (only when stdin is a terminal)
     all other tunables:  CLI flag  >  CONFIGURATION constant below
 The password is never accepted as a flag, never logged, and never written to disk.
 
@@ -55,6 +56,7 @@ import ssl
 import subprocess
 import sys
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,6 +131,22 @@ def _scrub(text, data):
             for form in (str(value), urllib.parse.quote_plus(str(value))):
                 text = text.replace(form, "***REDACTED***")
     return text
+
+
+def _scrub_body(obj, data):
+    """Mask the secret values of a request form wherever a reply body repeats them.
+
+    A server or proxy can echo the request target (token included) inside an error
+    message. _safe masks by key name; this masks by value, so the echo cannot reach the
+    log or an exception message under a key _safe does not know.
+    """
+    if isinstance(obj, dict):
+        return dict((key, _scrub_body(value, data)) for key, value in obj.items())
+    if isinstance(obj, list):
+        return [_scrub_body(item, data) for item in obj]
+    if isinstance(obj, str):
+        return _scrub(obj, data)
+    return obj
 
 
 def _prune_logs(log_dir, keep=LOG_RETENTION):
@@ -238,6 +256,7 @@ def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POS
         parsed = json.loads(raw)
     except ValueError:
         raise TransientError("non-JSON response from %s (%d bytes)" % (url, len(raw)))
+    parsed = _scrub_body(parsed, data)
     log.debug("response from %s: %s", url, _safe(parsed))
     return parsed
 
@@ -699,10 +718,40 @@ def _resolve_user(explicit):
         return ""
 
 
+_ON_WINDOWS = os.name == "nt"
+
+
+def _win_console_stdin():
+    """True when the Windows stdin handle is a console input buffer.
+
+    os.isatty() answers True for the NUL device, which is what a scheduler gives a task.
+    GetConsoleMode succeeds only for a real console handle.
+    """
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+    return bool(kernel32.GetConsoleMode(handle, ctypes.byref(ctypes.c_ulong())))
+
+
+def _stdin_is_terminal():
+    """True when a person can type at this process.
+
+    getpass on Windows reads the console, not stdin, so a scheduled run with no console
+    would wait forever. Without a terminal there is nobody to ask.
+    """
+    if not (sys.stdin and sys.stdin.isatty()):
+        return False
+    return _win_console_stdin() if _ON_WINDOWS else True
+
+
 def _resolve_password():
     from_env = os.environ.get("ARCGIS_SERVER_PASSWORD")
     if from_env:
         return from_env
+    if not _stdin_is_terminal():
+        return ""
     try:
         return getpass.getpass("ArcGIS Server admin password: ")
     except EOFError:
@@ -1671,8 +1720,72 @@ def self_test():
                 del module.input
             check(_resolve_password() == "stub-pass-n3m4", "the environment password wins")
             del os.environ["ARCGIS_SERVER_PASSWORD"]
-            getpass.getpass = lambda prompt: "typed-secret"
-            check(_resolve_password() == "typed-secret", "else getpass prompts for it")
+
+            class _Stdin(object):
+                def __init__(self, tty):
+                    self.tty = tty
+
+                def isatty(self):
+                    return self.tty
+
+            real_stdin = sys.stdin
+            real_on_windows = module._ON_WINDOWS
+            real_console = module._win_console_stdin
+            module._ON_WINDOWS = False
+            prompted = []
+
+            def typed(prompt):
+                prompted.append(prompt)
+                return "typed-secret"
+
+            getpass.getpass = typed
+            try:
+                sys.stdin = _Stdin(True)
+                check(_resolve_password() == "typed-secret" and len(prompted) == 1,
+                      "else getpass prompts for it, when stdin is a terminal")
+                del prompted[:]
+                sys.stdin = _Stdin(False)
+                check(_resolve_password() == "" and not prompted,
+                      "with stdin not a terminal the password is never prompted for, so a "
+                      "console-less run cannot hang  <-- pinned defect")
+                sys.stdin = None
+                check(_resolve_password() == "" and not prompted,
+                      "with no stdin at all the password is not prompted for either")
+                sys.stdin = _Stdin(True)
+                module._ON_WINDOWS = True
+                module._win_console_stdin = lambda: False
+                check(_resolve_password() == "" and not prompted,
+                      "on Windows a stdin that passes isatty but is not a console (the NUL"
+                      " device of a scheduled task) is not prompted for  <-- pinned defect")
+                module._win_console_stdin = lambda: True
+                check(_resolve_password() == "typed-secret" and len(prompted) == 1,
+                      "on Windows a real console stdin is prompted for")
+                module._ON_WINDOWS = real_on_windows
+                module._win_console_stdin = real_console
+                check(not _ON_WINDOWS or isinstance(_win_console_stdin(), bool),
+                      "the Windows console probe answers a bool for the real stdin handle")
+                import ctypes
+                real_windll = getattr(ctypes, "windll", None)
+
+                def kernel(console):
+                    def get_mode(handle, _ref):
+                        return 1 if handle == 7 and console else 0
+                    return types.SimpleNamespace(
+                        kernel32=types.SimpleNamespace(GetStdHandle=lambda _n: 7,
+                                                       GetConsoleMode=get_mode))
+                try:
+                    ctypes.windll = kernel(True)
+                    first = _win_console_stdin()
+                    ctypes.windll = kernel(False)
+                    second = _win_console_stdin()
+                finally:
+                    ctypes.windll = real_windll  # None on Linux, where the name did not exist
+                check(first is True and second is False,
+                      "the Windows console probe is true for a console handle and false for NUL")
+            finally:
+                sys.stdin = real_stdin
+                module._ON_WINDOWS = real_on_windows
+                module._win_console_stdin = real_console
 
             def no_terminal(prompt):
                 raise EOFError("EOF when reading a line")
@@ -1680,12 +1793,17 @@ def self_test():
             getpass.getpass = no_terminal
             module.input = no_terminal
             try:
+                sys.stdin = _Stdin(True)
+                module._ON_WINDOWS = False
                 check(_resolve_user(None) == "" and _resolve_password() == "",
                       "with no terminal, a prompt reads as a blank answer, not a crash")
+                sys.stdin = _Stdin(False)
                 code, out, err = _quiet(main, ["--server-url", "https://s.example.org/x",
                                                "--command", "c", "--service", "A.MapServer",
                                                "--apply"])
             finally:
+                sys.stdin = real_stdin
+                module._ON_WINDOWS = real_on_windows
                 del module.input
             check(code == 64 and "username and password are required" in err,
                   "--apply with no credentials and no terminal exits 64, not a traceback"
@@ -1844,6 +1962,31 @@ def self_test():
                   "_scrub masks a token in its raw and its form-encoded spelling")
             check(_scrub("json", {"f": "json"}) == "json" and _scrub("x", {"token": ""}) == "x",
                   "_scrub leaves a form with no secret alone")
+            echoed = {"error": {"code": 500, "message": "failed for /m?token=T0K%2FEN%2Bx%3D9&f=json"},
+                      "list": ["a T0K/EN+x=9", 7, None], "n": 3}
+            scrubbed = _scrub_body(echoed, {"token": secret, "f": "json"})
+            check("T0K" not in json.dumps(scrubbed) and scrubbed["n"] == 3
+                  and scrubbed["list"][1:] == [7, None] and scrubbed["error"]["code"] == 500,
+                  "_scrub_body masks an echoed token in any string of a reply and keeps the rest")
+            install()
+            stub = _StubAdmin(["A.MapServer"], machines_reply={"error": {
+                "code": 500, "message": "upstream failed for /x/admin/machines?token=%s&f=json"
+                % _StubAdmin.TOKEN}})
+            collected = _Collect()
+            log.addHandler(collected)
+            log.setLevel(logging.DEBUG)
+            try:
+                exc = raises(lambda: get_machines(stub.url, _StubAdmin.TOKEN, False, 1),
+                             SvcGuardError, "a machines error that echoes the request is a refusal",
+                             "upstream failed")
+            finally:
+                log.setLevel(logging.CRITICAL)
+                log.removeHandler(collected)
+                stub.close()
+            check(_StubAdmin.TOKEN not in str(exc) and _StubAdmin.TOKEN
+                  not in " ".join(collected.lines) and len(collected.lines) > 0,
+                  "an admin token echoed in a reply body reaches neither the exception nor the"
+                  " debug log  <-- pinned defect")
             install()
             exc = raises(lambda: real_http("http://127.0.0.1:9/a b", {"token": secret, "f": "json"},
                                            method="GET"),
@@ -2027,11 +2170,11 @@ def self_test():
                 path = os.path.join(work, "ran-" + name)
                 return path, '"%s" -c "open(r\'%s\', \'w\').close()"' % (sys.executable, path)
 
-            def cli_run(stub_services, services, extra, name, machines=()):
+            def cli_run(stub_services, services, extra, name, machines=(), fail_start=()):
                 """One real --apply run against a stub. Returns (code, err, ran, stub)."""
                 path, command = marker_command(name)
                 module.LOG_DIR = os.path.join(work, "logs-" + name)
-                stub = _StubAdmin(stub_services, machines=machines)
+                stub = _StubAdmin(stub_services, machines=machines, fail_start=fail_start)
                 argv = ["--server-url", stub.url, "--command", command, "--apply",
                         "--timeout", "20"] + extra
                 for service in services:
@@ -2146,6 +2289,20 @@ def self_test():
                   and not os.path.exists(lst) and not os.path.exists(lst + ".tmp"),
                   "a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect")
 
+            # A grown list that ends in a refusal or a failed start must not move the baseline.
+            for extra, kwargs, want, label in (
+                    (["--node", "gis-typo"], {"machines": ["gis-a.example.org"]}, 1,
+                     "a run refused at the node check"),
+                    ([], {"fail_start": [three[1]]}, 3, "a run with a failed start")):
+                with open(lst, "w", encoding="utf-8") as handle:
+                    json.dump({"svcguard_list": 1, "services": three[:1]}, handle)
+                before_text = slurp(lst)
+                code, err, ran_it, stub = cli_run(three, three[:2], ["--list-file", lst] + extra,
+                                                  "keep-" + str(want), **kwargs)
+                check(code == want and slurp(lst) == before_text
+                      and not os.path.exists(lst + ".tmp"),
+                      "the saved list is unchanged after %s  <-- pinned defect" % label)
+            os.remove(lst)
             code, err, ran_it, stub = cli_run(three, three, ["--node", "gis-a.example.org"],
                                               "node-ok", machines=["gis-a.example.org"])
             check(code == 0 and ran_it and len(stub.gets) == 1,

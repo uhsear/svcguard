@@ -47,38 +47,44 @@ PASS 152  --server-url 'gis.example.org/server' is a usage error before anything
 ...
 PASS 160  the longest prefix --appl of --apply is refused too  <-- pinned defect
 ...
-PASS 168  --apply with no credentials and no terminal exits 64, not a traceback  <-- pinned defect
-PASS 169  an unwritable log directory exits 64 before any service is touched  <-- pinned defect
+PASS 167  with stdin not a terminal the password is never prompted for, so a console-less run cannot hang  <-- pinned defect
 ...
-PASS 175  a reply cut short is retried, not read as a failed start  <-- pinned defect
+PASS 169  on Windows a stdin that passes isatty but is not a console (the NUL device of a scheduled task) is not prompted for  <-- pinned defect
 ...
-PASS 212  a mistyped --node refuses the run instead of using every node  <-- pinned defect
+PASS 174  --apply with no credentials and no terminal exits 64, not a traceback  <-- pinned defect
+PASS 175  an unwritable log directory exits 64 before any service is touched  <-- pinned defect
 ...
-PASS 218  a redirected machine list refuses the run and the token goes nowhere else  <-- pinned defect
+PASS 181  a reply cut short is retried, not read as a failed start  <-- pinned defect
 ...
-PASS 227  a shorter list is refused and the note names the dropped service  <-- pinned defect
+PASS 213  an admin token echoed in a reply body reaches neither the exception nor the debug log  <-- pinned defect
 ...
-PASS 253  a refused shrink leaves the saved list as it was  <-- pinned defect
+PASS 221  a mistyped --node refuses the run instead of using every node  <-- pinned defect
 ...
-PASS 257  the saved list is unchanged after --allow-shrink on a run whose login fails  <-- pinned defect
-PASS 258  the saved list is unchanged after a growing list on a run whose login fails  <-- pinned defect
-PASS 259  a first run that never logs in saves no list  <-- pinned defect
+PASS 227  a redirected machine list refuses the run and the token goes nowhere else  <-- pinned defect
 ...
-PASS 264  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
-PASS 265  a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect
+PASS 236  a shorter list is refused and the note names the dropped service  <-- pinned defect
 ...
-PASS 273  importing the file runs no main()
+PASS 262  a refused shrink leaves the saved list as it was  <-- pinned defect
+...
+PASS 266  the saved list is unchanged after --allow-shrink on a run whose login fails  <-- pinned defect
+PASS 267  the saved list is unchanged after a growing list on a run whose login fails  <-- pinned defect
+PASS 268  a first run that never logs in saves no list  <-- pinned defect
+...
+PASS 273  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
+PASS 274  a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect
+...
+PASS 284  importing the file runs no main()
 ------------------------------------------------------------
-273 assertions, 0 failed
+284 assertions, 0 failed
 ```
 
-The full run prints all 273 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 284 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
 took 10 to 14 seconds on Windows with Python 3.12 or 3.13 and about 4 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9, 3.12 and 3.13 and Linux 3.12 print the same 273 lines.
+3.9, 3.12 and 3.13 and Linux 3.12 print the same 284 lines.
 
 ## Install
 
@@ -179,7 +185,7 @@ middle service (assertions 115 to 124), a stop that never lands on the second of
 to 129), and a token failure on one start (130 to 132). A single `--service` runs stop, poll,
 start, poll and nothing else, as it did before several services existed (133). A stop phase
 that fails on the first of three still reports "1 of 3" (134). A refused login and a failed
-stop token send no start (66 to 69), and neither does an unreachable server (173).
+stop token send no start (66 to 69), and neither does an unreachable server (179).
 
 ## Node names and the saved list
 
@@ -189,22 +195,22 @@ GET to the site machines resource, documented on the Esri
 page. Its Methods section documents GET for reading machines, and it names each machine under
 `machineName`. The page also lists Register and Rename, which svcguard never calls.
 If a `--node` is not in that list, or the reply cannot be read, the run exits 1 before any stop.
-It does not fall back to "all nodes". Assertions 212 and 213 cover the mistyped name and show
+It does not fall back to "all nodes". Assertions 221 and 222 cover the mistyped name and show
 that no stop, start or status request follows it.
 
 **A shrunk list is refused.** A maintenance window grows by hand: someone adds a service,
 someone else drops one while editing the command line, and the dropped service is no longer
 stopped before the command or started after it. With `--list-file`, each run compares its own
 services with the saved ones, without regard to case. A service that dropped out is refused
-with exit 1 (assertions 227 and 253) unless `--allow-shrink` says it was deliberate. A swap, one
+with exit 1 (assertions 236 and 262) unless `--allow-shrink` says it was deliberate. A swap, one
 service added and one dropped, counts as a shrink. A file that exists but is not a svcguard list
-exits 64 and is never read as "no list" (232 to 238, 260).
+exits 64 and is never read as "no list" (242 to 248, 271).
 
 **The list moves only after the command ran.** svcguard stages the new list beside the old one
 and replaces the old one only when the run ends in exit 0 or 2. A run refused at the login or the
-node check, or one with a failed start, leaves the saved list as it was (256 to 258). Otherwise a
+node check, or one with a failed start, leaves the saved list as it was (266 to 268, 275, 276). Otherwise a
 failed `--allow-shrink` run would store the short list and hide the shrink from the next run. A
-dry run never writes the file (242).
+dry run never writes the file (252).
 
 ## Configuration
 
@@ -213,7 +219,7 @@ source**. The same rule is written at the top of `svcguard.py` under `CONFIG PRE
 
 ```
 user       --user     >  env ARCGIS_SERVER_USER      >  interactive prompt
-password   (no flag)  >  env ARCGIS_SERVER_PASSWORD  >  interactive getpass prompt
+password   (no flag)  >  env ARCGIS_SERVER_PASSWORD  >  interactive getpass prompt (console only)
 tunables   CLI flag   >  CONFIGURATION constant
 ```
 
@@ -224,13 +230,26 @@ the script. Change them there, not at the call site.
 
 The password is never a flag, never logged, never written to disk. Every response body is
 passed through a redactor before it reaches the DEBUG log file, because the `generateToken`
-response body is itself the secret. Four assertions read the log file back to prove the
-token is absent, the redaction marker is present, and the response was logged at all. A fifth
-reads the log of a full `--apply` run over HTTP and finds neither the token nor the password.
+response body is itself the secret. Three assertions read the log file back to prove the
+token is absent and the redaction marker is present (97 to 99). A fourth checks that the
+polled states were logged at all (100). A fifth (140) reads the log of a full `--apply` run
+over HTTP and finds neither the token nor the password. A sixth (213) has a server echo the
+request target, token included, inside an error body, and finds the token in neither the
+exception nor the log: svcguard also masks the secrets it sent wherever a reply repeats them.
 
 A bad `--server-url` is caught before any request leaves: no scheme, no host, or credentials
 typed into the URL (they would reach the log and the error messages). With no terminal and no
 credentials in the environment, a scheduled run exits 64 with one line, not a traceback.
+svcguard prompts for the password only when stdin is a console. On Windows `os.isatty()` also
+answers true for the NUL device that a scheduler gives a task, and `getpass` then waits on a
+console nobody can type at. So svcguard asks Windows whether the stdin handle is a console
+input buffer, through
+[`GetStdHandle`](https://learn.microsoft.com/en-us/windows/console/getstdhandle) and
+[`GetConsoleMode`](https://learn.microsoft.com/en-us/windows/console/getconsolemode)
+(assertions 167 to 172). Microsoft documents `GetConsoleMode` for a console buffer handle and
+a zero return on failure. That it fails for NUL was observed here: a detached run with stdin on
+NUL exited 64 at once, where before it hung. A password piped into stdin is not read; set
+`ARCGIS_SERVER_PASSWORD`.
 
 ## What already exists
 
@@ -336,21 +355,46 @@ backoffs.
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
 - **Coverage is 100 percent.** The self-test imports the file once under another module name
-  (assertion 273) to reach the false arc of `if __name__ == "__main__":`.
+  (assertion 284) to reach the false arc of `if __name__ == "__main__":`.
 - **The saved list can fail to update after a good run.** If the command ran but the saved list
   cannot be replaced, for example because another program holds the file open, svcguard logs an
-  error and keeps the run's own exit code (assertion 265). The next run compares against the
+  error and keeps the run's own exit code (assertion 274). The next run compares against the
   old list.
 - **A dry run does not test the saved list path.** With `--list-file` in a directory that does
   not exist, the dry run says the list will be saved and exits 0. The real run then exits 64.
 - **Ctrl-C can leave `PATH.tmp` behind.** An interrupt after the list is staged ends with a
   traceback and a stray temporary file next to the saved list. The saved list itself is intact.
-- **Secrets are masked by key name only.** svcguard masks values under the keys `token`,
-  `password`, `passwd`, `secret` and `credentials`. A server or proxy that echoes the request
-  URL inside an error body can write the short-lived admin token to the log.
+- **Secrets are masked by key name, and by value for what svcguard sent.** svcguard masks
+  values under the keys `token`, `password`, `passwd`, `secret` and `credentials`. It also masks
+  the token or password it sent when a reply repeats it in any string (assertions 211 to 213).
+  A different secret that a server invents and puts under another key is not masked.
 - **A console that cannot encode `--command` can break the dry run.** The dry run prints the
   command with `%r`. A character the console code page cannot encode may raise an error there.
   The dry run writes nothing.
+- **A shrunk-list refusal reaches stderr only.** The refusal comes before logging starts, so no
+  log file holds it. For this cause the log line before exit 1 does not exist; read the console.
+- **A refused `--node` ends with a misleading log line.** The log says "REFUSING to run the
+  maintenance command: not every service is confirmed STOPPED". The line before it,
+  "--node not in this site", names the real cause.
+- **The Ctrl-C start-up behaviour was checked by hand, not by the self-test.** On Linux with
+  Python 3.12 against a local stub, Ctrl-C during the command started the services again and
+  then left the traceback.
+- **TLS is tested on the SSL context only.** Assertions 15 to 18 check the context object that
+  `--insecure` changes. The whole self-test runs over plain `http://` on `127.0.0.1`, so no real
+  TLS handshake or certificate check is exercised.
+- **Esri documents the machines GET, not a token in its query string.** The
+  [`machines`](https://developers.arcgis.com/rest/enterprise-administration/server/machines/)
+  page documents GET and the `machineName` reply. Its Tokens text asks for the token in the body
+  of a POST. svcguard relies on the admin API accepting the query token on this GET.
+- **A dry run does not check `--node`.** It makes no HTTP call, so it exits 0 for a mistyped
+  name. Only the real run checks the names against the site.
+- **Names are not checked for path segments.** `--service` accepts `.`, `..` and `/` in a name,
+  and `--server-url` accepts a query string or a fragment. A name or URL like that changes the
+  admin request path, and the dry run and error text print the URL as typed. The values come from
+  the operator, never from the server.
+- **`PATH.tmp` is overwritten and removed.** svcguard stages the new list in the saved list's
+  path plus `.tmp`. It overwrites any file already there and deletes it when the run is refused
+  or fails, even if svcguard did not make it.
 - **`--node` is a check, not a filter.** A valid partial `--node` still stops and starts the
   services across every machine of the site, and only logs a warning about the machines it did
   not name.
@@ -359,7 +403,7 @@ backoffs.
   proxy on the path. svcguard's own log and output never carry it.
 - **A redirected machine list is refused.** The machines GET carries the token in its query
   string, so svcguard follows no redirect there. A 301, 302 or 303 reply is an exit 1 refusal
-  (assertion 218), and the token goes to no other host. Give the final URL.
+  (assertion 227), and the token goes to no other host. Give the final URL.
 - **A `--node` name must match exactly.** The comparison ignores case only. A short host name
   does not match a fully qualified one, so the run is refused and you must type the listed name.
 - **The saved list stores service names only.** A service that moved to another folder or type
