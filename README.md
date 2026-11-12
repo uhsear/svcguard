@@ -73,18 +73,23 @@ PASS 268  a first run that never logs in saves no list  <-- pinned defect
 PASS 273  a saved list that cannot be written exits 64 before any service is touched  <-- pinned defect
 PASS 274  a saved list that cannot be replaced keeps the run's exit code  <-- pinned defect
 ...
-PASS 284  importing the file runs no main()
+PASS 284  a stop the server refused is not started, and exits 1 not 3  <-- pinned defect
+...
+PASS 286  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
+PASS 287  with no stdin the user-name prompt reads as blank  <-- pinned defect
+PASS 288  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
+PASS 289  importing the file runs no main()
 ------------------------------------------------------------
-284 assertions, 0 failed
+289 assertions, 0 failed
 ```
 
-The full run prints all 284 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 289 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
-took 10 to 14 seconds on Windows with Python 3.12 or 3.13 and about 4 seconds on Linux with
+took 10 to 15 seconds on Windows with Python 3.9, 3.12 or 3.13 and about 4 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9, 3.12 and 3.13 and Linux 3.12 print the same 284 lines.
+3.9, 3.12 and 3.13 and Linux 3.12 print the same 289 lines.
 
 ## Install
 
@@ -138,7 +143,7 @@ python svcguard.py --server-url https://gis.example.org/server --service Parcels
 | `--list-file PATH` | none | JSON file that keeps the service names a run guards. A later run whose list dropped a service is refused, exit 1. Written only with `--apply`. The saved file is replaced only after the run ends in exit 0 or 2 |
 | `--allow-shrink` | off | Accept a shorter list than the saved one. Needs `--list-file` |
 | `--apply` | off | Actually talk to the server. Without it, zero HTTP calls happen |
-| `--user USER` | env, else prompt | Admin user |
+| `--user USER` | env, else prompt on a terminal | Admin user. With no terminal and no `ARCGIS_SERVER_USER`, the run exits 64 |
 | `--timeout N` | 120 | Seconds for each service to reach `STOPPED` or `STARTED`. 1 or more |
 | `--retries N` | 3 | Attempts per HTTP call, exponential backoff. 1 or more |
 | `--insecure` | off | Skip TLS verification |
@@ -153,7 +158,7 @@ command ran and failed.
 | Exit | Meaning |
 |---|---|
 | 0 | Every service stopped, the command succeeded, every service started |
-| 1 | The command was refused: a service never confirmed `STOPPED`, the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded |
+| 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded |
 | 2 | The command failed or could not run. Every start succeeded |
 | 3 | At least one service could not be started again. Look now |
 | 64 | Usage or setup error: a bad flag or value, no credentials and no terminal to ask, a log directory that cannot be written, or a saved list that cannot be read or written. Nothing was contacted |
@@ -170,9 +175,12 @@ service down exits 3, not 1.
 3. **Run the command only if every service confirmed `STOPPED`.** Otherwise the command is
    refused.
 4. **Start every service a stop was sent for, newest first.** That includes the service the
-   stop phase failed on, because a stop that timed out can leave a service half down. If the
-   stop phase failed before it sent any stop, such as a refused login or an unreachable server,
-   nothing is started, the command is refused, and the run exits 1.
+   stop phase failed on, because a stop that timed out, met a 5xx reply or lost its connection
+   can leave a service half down. A stop the server refused outright changed nothing, so that
+   service is not started: a 4xx reply, a redirect, or an error in the reply body, such as the
+   404 for a mistyped service name. If the stop phase failed before it sent any stop, such as a
+   refused login or an unreachable server, nothing is started, the command is refused, and the
+   run exits 1.
 5. **Start each one on its own.** Each start requests a fresh token, sends its start request,
    and polls for `STARTED`. A failure is logged and the next start goes ahead. A token failure
    costs one start only.
@@ -185,7 +193,10 @@ middle service (assertions 115 to 124), a stop that never lands on the second of
 to 129), and a token failure on one start (130 to 132). A single `--service` runs stop, poll,
 start, poll and nothing else, as it did before several services existed (133). A stop phase
 that fails on the first of three still reports "1 of 3" (134). A refused login and a failed
-stop token send no start (66 to 69), and neither does an unreachable server (179).
+stop token send no start (66 to 69), and neither does an unreachable server (179). A stop the
+server refuses sends no start for that service and exits 1, not 3 (284 and 285). Before that
+fix, a mistyped service name was started, refused again, and reported as "may be down" with
+exit 3.
 
 ## Node names and the saved list
 
@@ -239,17 +250,26 @@ exception nor the log: svcguard also masks the secrets it sent wherever a reply 
 
 A bad `--server-url` is caught before any request leaves: no scheme, no host, or credentials
 typed into the URL (they would reach the log and the error messages). With no terminal and no
-credentials in the environment, a scheduled run exits 64 with one line, not a traceback.
-svcguard prompts for the password only when stdin is a console. On Windows `os.isatty()` also
+credentials in the environment, a scheduled run exits 64 with one line, not a traceback. That
+includes a process with no stdin at all (assertions 287 and 288, the second a real child
+process). svcguard prompts for the user name and the password only when stdin is a console.
+Before this check, the user-name prompt read a piped line as the name, blocked on an open pipe,
+and crashed with a `RuntimeError` when stdin was closed. On Windows `os.isatty()` also
 answers true for the NUL device that a scheduler gives a task, and `getpass` then waits on a
 console nobody can type at. So svcguard asks Windows whether the stdin handle is a console
 input buffer, through
 [`GetStdHandle`](https://learn.microsoft.com/en-us/windows/console/getstdhandle) and
 [`GetConsoleMode`](https://learn.microsoft.com/en-us/windows/console/getconsolemode)
 (assertions 167 to 172). Microsoft documents `GetConsoleMode` for a console buffer handle and
-a zero return on failure. That it fails for NUL was observed here: a detached run with stdin on
-NUL exited 64 at once, where before it hung. A password piped into stdin is not read; set
-`ARCGIS_SERVER_PASSWORD`.
+a zero return on failure. That it fails for NUL was observed by hand on Windows with Python
+3.13: an inherited NUL stdin passed `isatty()` and failed the console probe. A detached run with
+stdin on NUL exiting 64 at once, where before it hung, is also a hand observation, not a
+self-test result. Assertions 169 to 172 replace the Windows library with a stub that answers by
+handle number, so the console-true side never runs on a real console. The Microsoft page also
+says `GetConsoleMode` should not be used to decide whether a handle is a console, and names
+`NtQueryVolumeInformationFile` as the alternative. svcguard keeps `GetConsoleMode` because it
+fails safe: a doubtful handle reads as no console, so the run exits 64 instead of hanging. A
+password piped into stdin is not read; set `ARCGIS_SERVER_PASSWORD`.
 
 ## What already exists
 
@@ -336,9 +356,11 @@ backoffs.
   command that prints or logs its environment writes the admin password to that output.
 - **The command text is logged.** `--command` appears in the dry run, on the console and in the
   log file. Keep passwords out of it, for example a `sqlcmd -P` flag.
-- **POST redirects are followed.** urllib follows a 301, 302 or 303 reply to the `Location`
-  address as a GET without the body, so the password is not sent again. A login behind a
-  redirect is not expected to complete, and no assertion covers it. Give the final URL.
+- **A redirected POST is refused.** A 301, 302 or 303 reply to the login, a stop, a start or a
+  status request is an exit 1 refusal and svcguard contacts no other host (assertion 286).
+  Before this check urllib sent a body-less GET to the new address and svcguard believed its
+  JSON. Give the final URL, for example the one behind a load balancer that redirects http to
+  https.
 - **`http://` is warned about, not refused.** The admin password then travels in clear text.
   Use `https://` unless the network is trusted.
 - **The script directory must be writable.** The log folder lives beside the script. If it
@@ -355,7 +377,7 @@ backoffs.
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
 - **Coverage is 100 percent.** The self-test imports the file once under another module name
-  (assertion 284) to reach the false arc of `if __name__ == "__main__":`.
+  (assertion 289) to reach the false arc of `if __name__ == "__main__":`.
 - **The saved list can fail to update after a good run.** If the command ran but the saved list
   cannot be replaced, for example because another program holds the file open, svcguard logs an
   error and keeps the run's own exit code (assertion 274). The next run compares against the
@@ -378,7 +400,9 @@ backoffs.
   "--node not in this site", names the real cause.
 - **The Ctrl-C start-up behaviour was checked by hand, not by the self-test.** On Linux with
   Python 3.12 against a local stub, Ctrl-C during the command started the services again and
-  then left the traceback.
+  then left the traceback. A later audit could not reproduce this: its Linux attempt ignored
+  SIGINT, because background jobs of a non-interactive shell start with SIGINT ignored. Treat
+  the claim as unconfirmed.
 - **TLS is tested on the SSL context only.** Assertions 15 to 18 check the context object that
   `--insecure` changes. The whole self-test runs over plain `http://` on `127.0.0.1`, so no real
   TLS handshake or certificate check is exercised.
@@ -417,6 +441,16 @@ backoffs.
 - **The saved list records what the run intended, once the command ran.** It holds the services
   this run named, not proof that each was guarded. A crash while saving can leave a stray `.tmp`
   file beside it.
+- **A first run that is refused or leaves a service down saves no list.** The list moves only
+  after the command ran, so the next run counts as a first run and has nothing to compare with.
+- **A short secret can mask part of a reply.** svcguard masks the password it sent wherever a
+  reply repeats it. A password of a few characters that also occurs inside a word of the reply
+  turns that word into `***REDACTED***`, so a good reply can read as a failure. The result is a
+  refusal, never a clean run.
+- **Two runs that start in the same second write to one log file.** The name is
+  `svcguard_YYYYMMDD_HHMMSS.log`, and both runs append to it.
+- **Delete `logs/` before you zip the directory.** The log folder is ignored by git, but its
+  files can hold the account name of the person who ran the tool.
 - **Exit 1 has two causes.** It covers both a refusal on a finding (an unknown `--node`, a shrunk
   list, a service that never reached `STOPPED`) and a login or server that failed. Read the log
   line before it.

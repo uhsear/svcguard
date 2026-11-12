@@ -86,6 +86,10 @@ class SvcGuardError(Exception):
     """Non-retryable failure: the server answered, and the answer was bad."""
 
 
+class ServerRefused(SvcGuardError):
+    """The server answered and turned the request down, so it changed nothing."""
+
+
 class TransientError(Exception):
     """Retryable failure: transport, timeout, 5xx, unparseable body."""
 
@@ -220,18 +224,17 @@ def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POS
     headers = {"User-Agent": "svcguard/%s" % __version__}
     try:
         if method == "GET":
-            # No redirect handler: urllib would repeat this query, token included, at
-            # whatever host the Location header names. A redirect becomes an HTTPError.
             request = urllib.request.Request(url + "?" + form, headers=headers)
-            opened = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=_ssl_context(insecure)), _NoRedirect()
-            ).open(request, timeout=http_timeout)
         else:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             request = urllib.request.Request(url, data=form.encode("utf-8"), headers=headers)
-            opened = urllib.request.urlopen(
-                request, timeout=http_timeout, context=_ssl_context(insecure)
-            )
+        # No redirect handler for either method. urllib would send a 301, 302 or 303
+        # reply on as a body-less GET to whatever host the Location header names (a GET
+        # would carry the token in its query), and svcguard would then believe that host's
+        # JSON. A redirect becomes an HTTPError, and so a refusal.
+        opened = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_ssl_context(insecure)), _NoRedirect()
+        ).open(request, timeout=http_timeout)
         try:
             # utf-8-sig: a byte order mark would make json.loads refuse a good body.
             raw = opened.read().decode("utf-8-sig", "replace")
@@ -242,7 +245,7 @@ def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POS
         # service) is a permanent refusal. Retrying it only delays the page.
         if exc.code >= 500 or exc.code == 429:
             raise TransientError("HTTP %s from %s" % (exc.code, url))
-        raise SvcGuardError("HTTP %s from %s (not retryable)" % (exc.code, url))
+        raise ServerRefused("HTTP %s from %s (not retryable)" % (exc.code, url))
     except (ValueError, http.client.InvalidURL) as exc:
         # A URL urllib or http.client cannot use. No retry will fix it, and the message
         # can carry the request target, which holds the token on a GET.
@@ -268,11 +271,11 @@ def _check_ags(resp, what):
     if "error" in resp:
         err = resp["error"]
         code = err.get("code") if isinstance(err, dict) else None
-        raise SvcGuardError("%s: server error code=%s body=%s" % (what, code, _safe(resp)))
+        raise ServerRefused("%s: server error code=%s body=%s" % (what, code, _safe(resp)))
     # Whitelist, not blacklist: AGS says "error" here, not "failed", and a future
     # endpoint could invent a third word. Anything that is not "success" is not.
     if "status" in resp and resp["status"] != "success":
-        raise SvcGuardError("%s: status=%s body=%s" % (what, resp["status"], _safe(resp)))
+        raise ServerRefused("%s: status=%s body=%s" % (what, resp["status"], _safe(resp)))
     return resp
 
 
@@ -523,8 +526,9 @@ def restart_order(services, reached):
     reached is the index of the last service a stop request was sent for, or -1
     when none was sent. The stop phase halts at its first failure, so the services
     after it were never touched and are left exactly as they were. The one it failed
-    on is started too: a stop that timed out can leave a service half down. When no
-    stop was sent, nothing was stopped and nothing is started.
+    on is started too: a stop that timed out can leave a service half down. A stop
+    the server refused outright changed nothing, so guard() does not count it as
+    reached. When no stop was sent, nothing was stopped and nothing is started.
     """
     return list(reversed(services[:reached + 1]))
 
@@ -567,6 +571,7 @@ def guard(server_url, services, command, username, password, insecure, retries, 
     nodes, when given, is checked against the site's machines before the first stop.
     """
     reached = -1      # index of the last service a stop was sent for; -1 = none yet
+    stopping = None   # the service whose stop request is being sent, for the log
     all_stopped = False
     command_rc = None
     failed = []
@@ -579,17 +584,26 @@ def guard(server_url, services, command, username, password, insecure, retries, 
                 verify_nodes(server_url, token, nodes, insecure, retries)
             for index, service in enumerate(services):
                 reached = index
+                stopping = service
                 log.info("Stopping %s ...", service)
-                manage_service(server_url, service, token, "stop", insecure, retries)
+                try:
+                    manage_service(server_url, service, token, "stop", insecure, retries)
+                except ServerRefused:
+                    # Refused outright (a mistyped name, a 4xx, an error body): nothing
+                    # stopped, so a start would only repeat the refusal and exit 3.
+                    reached = index - 1
+                    log.error("%s: the server refused the stop, so no start is sent for it",
+                              service)
+                    raise
                 wait_for_state(server_url, service, token, "STOPPED", insecure, retries,
                                timeout)
                 log.info("%s is STOPPED.", service)
             all_stopped = True
         except Exception as exc:
-            if reached < 0:
+            if stopping is None:
                 log.error("Stop phase failed before any stop was sent: %s", exc)
             else:
-                log.error("Stop phase failed at %s: %s", services[reached], exc)
+                log.error("Stop phase failed at %s: %s", stopping, exc)
 
         if all_stopped:
             try:
@@ -712,9 +726,13 @@ def _resolve_user(explicit):
     from_env = os.environ.get("ARCGIS_SERVER_USER")
     if from_env:
         return from_env
+    if not _stdin_is_terminal():
+        # input() would block on an open pipe, read a piped line as the name, or raise
+        # RuntimeError when stdin is closed. Nobody can answer, so read it as blank.
+        return ""
     try:
         return input("ArcGIS Server admin user: ").strip()
-    except EOFError:  # no terminal (scheduler, cron): same as a blank answer
+    except EOFError:  # the terminal closed under the prompt: same as a blank answer
         return ""
 
 
@@ -839,8 +857,8 @@ def main(argv=None):
         print("  start    : %s (each with a fresh token; a failed start skips no other)"
               % " -> ".join(restart_order(services, len(services) - 1)))
         if nodes:
-            print("  nodes    : %s (checked against the site's machine list before any stop)"
-                  % ", ".join(nodes))
+            print("  nodes    : %s (checked against the site's machine list before any stop,"
+                  " with --apply only)" % ", ".join(nodes))
         if verdict:
             print("  list     : %s" % note)
         print("  tls      : %s" % ("VERIFICATION DISABLED (--insecure)" if args.insecure
@@ -1019,12 +1037,14 @@ class _StubAdmin(object):
     CUT = object()
 
     def __init__(self, services, fail_start=(), never_stops=(), cut_status=0, machines=(),
-                 machines_reply=None):
+                 machines_reply=None, refuse_stop=()):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import threading
         self.state = dict((name, "STARTED") for name in services)
         self.fail_start = set(fail_start)
         self.never_stops = set(never_stops)
+        self.refuse_stop = set(refuse_stop)
+        self.post_redirect = None
         self.cut_status = cut_status
         self.ops = []
         self.forms = []
@@ -1041,6 +1061,12 @@ class _StubAdmin(object):
                 length = int(self.headers.get("Content-Length"))
                 form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
                 stub.forms.append(form)
+                if stub.post_redirect:
+                    self.send_response(302)
+                    self.send_header("Location", stub.post_redirect + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 reply = stub.answer(self.path)
                 if reply is stub.CUT:
                     raw = b'{"configuredState": "STA'
@@ -1096,6 +1122,9 @@ class _StubAdmin(object):
             return self.CUT
         if op == "status":
             return {"configuredState": self.state[service], "realTimeState": self.state[service]}
+        if op == "stop" and service in self.refuse_stop:
+            # The shape of the error envelope the admin API sends for a name it lacks.
+            return {"error": {"code": 404, "message": "service not found"}}
         if op == "start" and service in self.fail_start:
             # The documented shape of a start the server refuses.
             return {"status": "error", "code": 500, "messages": ["cannot start"]}
@@ -1232,8 +1261,8 @@ def self_test():
         check(calls[0] == 1, "a server refusal is NOT retried")
 
         # HTTP-status classification, exercised through the real _http_json by
-        # replacing urlopen. Nothing is dialled: the fake raises before any socket.
-        real_urlopen = urllib.request.urlopen
+        # replacing OpenerDirector.open. Nothing is dialled: the fake raises before any socket.
+        real_open = urllib.request.OpenerDirector.open
         opened = [0]
 
         def _raise_http(code):
@@ -1245,8 +1274,8 @@ def self_test():
         try:
             for code in (401, 403, 404):
                 opened[0] = 0
-                urllib.request.urlopen = _raise_http(code)
-                install()  # restore the real _http_json under the fake urlopen
+                urllib.request.OpenerDirector.open = _raise_http(code)
+                install()  # restore the real _http_json under the fake open
                 raises(lambda: _request("https://s.example.org/x", {}, False, 3, "perm"),
                        SvcGuardError,
                        "HTTP %d is a refusal, not a transient  <-- pinned defect" % code,
@@ -1255,14 +1284,14 @@ def self_test():
 
             for code in (429, 500, 503):
                 opened[0] = 0
-                urllib.request.urlopen = _raise_http(code)
+                urllib.request.OpenerDirector.open = _raise_http(code)
                 install()
                 raises(lambda: _request("https://s.example.org/x", {}, False, 3, "temp"),
                        SvcGuardError, "HTTP %d is retried as transient" % code,
                        "after 3 attempt")
                 check(opened[0] == 3, "HTTP %d used all 3 attempts" % code)
         finally:
-            urllib.request.urlopen = real_urlopen
+            urllib.request.OpenerDirector.open = real_open
 
         # ---- group C: wait_for_state ------------------------------------
         fake = _FakeServer(states=["STARTED", "STARTED", "STOPPED"])
@@ -1700,11 +1729,14 @@ def self_test():
                    "64")
             del os.environ["ARCGIS_SERVER_USER"]
             module.input = lambda prompt: "   "
+            real_terminal = module._stdin_is_terminal
+            module._stdin_is_terminal = lambda: True
             try:
                 code, out, err = _quiet(main, ["--server-url", "https://s.example.org/x", "--command", "c",
                                                "--service", "A.MapServer", "--apply"])
             finally:
                 del module.input
+                module._stdin_is_terminal = real_terminal
             check(code == 64 and "username and password are required" in err,
                   "--apply with a blank typed user is a usage error, before any HTTP")
 
@@ -1714,10 +1746,13 @@ def self_test():
             check(_resolve_user(None) == "env-user", "the environment user is next")
             del os.environ["ARCGIS_SERVER_USER"]
             module.input = lambda prompt: "  typed-user  "
+            real_terminal = module._stdin_is_terminal
+            module._stdin_is_terminal = lambda: True
             try:
                 check(_resolve_user(None) == "typed-user", "the prompt is last, and trimmed")
             finally:
                 del module.input
+                module._stdin_is_terminal = real_terminal
             check(_resolve_password() == "stub-pass-n3m4", "the environment password wins")
             del os.environ["ARCGIS_SERVER_PASSWORD"]
 
@@ -2330,6 +2365,78 @@ def self_test():
                 scratch = _Checker()
                 _quiet(_raises, scratch, fn, exc_type, "x", text)
                 check(scratch.failed == 1, "raises() records %s" % what)
+
+            # ---- group V: refused stops, redirects, no stdin --------------
+            # A stop the server refused outright changed nothing, so nothing is started
+            # for it. The old code started the name, got a second refusal and exited 3.
+            stub = _StubAdmin(three, refuse_stop=["B.GeocodeServer"])
+            ran = []
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 1 and ran == []
+                  and ("start", "B.GeocodeServer") not in stub.ops
+                  and ("start", "C.FeatureServer") not in stub.ops
+                  and ("start", "A.MapServer") in stub.ops,
+                  "a stop the server refused is not started, and exits 1 not 3"
+                  "  <-- pinned defect")
+            stub = _StubAdmin(["Parcels_Locater.GeocodeServer"],
+                              refuse_stop=["Parcels_Locater.GeocodeServer"])
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, ["Parcels_Locater.GeocodeServer"], "noop", "u", "p",
+                             False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 1 and ran == [] and [op for op, _ in stub.ops] == ["stop"],
+                  "a mistyped service name sends one refused stop and nothing else"
+                  "  <-- pinned defect")
+
+            # A 302 on a POST must not be followed: the second host answers the replayed
+            # GET with JSON, and svcguard used to believe it.
+            stub = _StubAdmin(three)
+            other = _StubAdmin(three)
+            other.machines_reply = {"token": "OTHER-HOST-TOKEN", "status": "success"}
+            stub.post_redirect = other.url.rpartition("/x")[0]
+            ran = []
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, three, "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+                other.close()
+            check(code == 1 and ran == [] and other.gets == [] and other.forms == []
+                  and stub.ops == [],
+                  "a redirected POST is a refusal and no other host is contacted"
+                  "  <-- pinned defect")
+
+            # No stdin at all: the user-name prompt must not run, whatever input() does.
+            module.input = _explode
+            sys.stdin = None
+            try:
+                blank = _resolve_user(None)
+            finally:
+                sys.stdin = real_stdin
+                del module.input
+            check(blank == "", "with no stdin the user-name prompt reads as blank"
+                  "  <-- pinned defect")
+            child_env = dict(os.environ)
+            for name in ("ARCGIS_SERVER_USER", "ARCGIS_SERVER_PASSWORD"):
+                child_env.pop(name, None)
+            child = subprocess.run(
+                [sys.executable, "-B", "-c",
+                 "import runpy, sys; sys.stdin = None; sys.argv = sys.argv[1:]; "
+                 "runpy.run_path(sys.argv[0], run_name='__main__')",
+                 os.path.abspath(__file__), "--server-url", "http://127.0.0.1:9/x",
+                 "--service", "A.MapServer", "--command", "echo m", "--apply"],
+                env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True)
+            check(child.returncode == 64 and "Traceback" not in child.stderr
+                  and "username and password are required" in child.stderr,
+                  "a real run with no stdin and no user exits 64, not a traceback"
+                  "  <-- pinned defect")
         finally:
             getpass.getpass = real_getpass
             module.LOG_DIR = real_log_dir
