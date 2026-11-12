@@ -79,21 +79,23 @@ PASS 291  a stop the server refused is still followed by a start, and exits 1 no
 ...
 PASS 294  a refused stop and a refused start on a service that is down exit 3, not 1  <-- pinned defect
 ...
-PASS 297  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
-PASS 298  with no stdin the user-name prompt reads as blank  <-- pinned defect
-PASS 299  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
-PASS 300  importing the file runs no main()
+PASS 297  a refused stop and a refused start with an HTTP 403 from status exit 3  <-- pinned defect
+...
+PASS 302  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
+PASS 303  with no stdin the user-name prompt reads as blank  <-- pinned defect
+PASS 304  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
+PASS 305  importing the file runs no main()
 ------------------------------------------------------------
-300 assertions, 0 failed
+305 assertions, 0 failed
 ```
 
-The full run prints all 300 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 305 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
-took 13 to 20 seconds on Windows with Python 3.9, 3.12 or 3.13 and about 5 seconds on Linux with
+took 13 to 27 seconds on Windows with Python 3.9, 3.12 or 3.13, depending on load, and about 5 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 300 PASS lines.
+3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 305 PASS lines.
 
 ## Install
 
@@ -164,7 +166,7 @@ assertions 95 to 97 cover a separate value, a `--name=value` pair and a short fl
 | Exit | Meaning |
 |---|---|
 | 0 | Every service stopped, the command succeeded, every service started |
-| 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded. The one exception is a service whose stop and start the server both refused: it is not counted as down when a status call shows it `STARTED` or answers that the service does not exist |
+| 1 | The command was refused: a service never confirmed `STOPPED`, the server refused a stop (for example a mistyped service name), the login or the server failed before the first stop, a `--node` is not in the site, or the saved list shrank. Every start that was needed succeeded. The one exception is a service whose stop and start the server both refused: it is not counted as down when a status call shows it `STARTED` or answers 404 (an HTTP 404, or code 404 in the reply body) for the name. Every other answer from that call, such as a 403 or an invalid-token body, leaves the state unread and the run exits 3 |
 | 2 | The command failed or could not run. Every start succeeded |
 | 3 | At least one service could not be started again. Look now |
 | 4 | The run finished clean (it would have been 0) but the saved list could not be updated, so the next run compares against a stale list. Every service is running again |
@@ -172,9 +174,10 @@ assertions 95 to 97 cover a separate value, a `--name=value` pair and a short fl
 
 A failed start outranks everything else, so a run that refused the command and also left a
 service down exits 3, not 1. That includes a service whose stop the server refused and whose
-start it refused too, unless a status call shows it `STARTED` or does not know the name. If
-that status call cannot be read either, the run exits 3, because svcguard cannot tell that the
-service is up.
+start it refused too, unless a status call shows it `STARTED` or answers 404 for the name. If
+that status call cannot be read, or answers with any other refusal (a 403, an invalid-token body,
+a server that is still starting), the run exits 3, because svcguard cannot tell that the
+service is up. Assertions 296 to 301 cover each case.
 
 ## How several services run
 
@@ -190,8 +193,8 @@ service is up.
    error in the reply body, such as the 404 for a mistyped service name) is followed by a start
    too, because a first attempt that timed out can have stopped the service before the retry was
    refused. Starting a started service is harmless. If that start is refused as well, a status
-   call decides: `STARTED` or an unknown name keeps the exit at 1, and anything else, or a
-   status that cannot be read, exits 3. If the stop phase failed before it sent any stop, such as a
+   call decides: `STARTED` or a 404 for the name keeps the exit at 1, and anything else, or a
+   status that cannot be read or is refused with another code, exits 3. If the stop phase failed before it sent any stop, such as a
    refused login or an unreachable server, nothing is started, the command is refused, and the
    run exits 1.
 5. **Start each one on its own.** Each start requests a fresh token, sends its start request,
@@ -210,7 +213,8 @@ stop token send no start (66 to 69), and neither does an unreachable server (184
 server refuses is still followed by a start (291), and a stop refused after it took effect
 leaves the service started (292). When that start is refused too, a mistyped name exits 1
 (293), a service that is down exits 3, not 1 (294), a service that reads `STARTED` exits 1
-(295), and a status that cannot be read exits 3 (296).
+(295), a status that cannot be read exits 3 (296), and a status refused with a 403 or an
+error body that is not a 404 exits 3 as well (297 to 300). An HTTP 404 from status exits 1 (301).
 
 ## Node names and the saved list
 
@@ -300,7 +304,7 @@ choice.
   services to come up.
 - The ArcGIS API for Python wraps the same endpoints as
   [`Service.start()` and `Service.stop()`](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.server.html),
-  each documented as returning a boolean. A loop over several services can check each result
+  each documented with a `bool` return type. A loop over several services can check each result
   and carry on to the next.
 
 Neither one runs a command between the stop and the start, or refuses that command when a stop
@@ -413,14 +417,17 @@ backoffs.
   check that the type is a real service type.
 - **A non-numeric port passes validation.** `--server-url https://h:abc/server` has a scheme,
   a host and no credentials. It fails at the first request (exit 1, nothing stopped).
-- **`--node` is a check, not a filter.** `--node gis-a` does not stop only that machine. The
-  services still stop for the whole site.
+- **svcguard has no node filter.** `--node` only refuses a name the site does not list. Every
+  machine of the site still stops and starts, and a machine that no `--node` names is only
+  warned about. svcguard cannot target one node.
 - **The 404 for a mistyped service name is the stub's reply.** The Esri
   [`stopService`](https://developers.arcgis.com/rest/enterprise-administration/server/stopservice/)
   page does not document the status for an unknown name. svcguard treats any 4xx as a refused
   stop; the 404 in the self-test is an assumption about a real server. The same assumption
-  holds for the status call after a refused stop and a refused start: svcguard reads an error
-  body from the status resource as "the server does not know this service".
+  holds for the status call after a refused stop and a refused start: only a 404 (HTTP or the
+  code in the reply body) reads as "the server does not know this service", and every other
+  refusal reads as an unread state and exits 3. A real server could answer an unknown name with
+  another code, and that would exit 3, not 1.
 - **A refused stop is still followed by one start request.** This is deliberate. A first stop
   attempt that timed out can have taken effect before the retry was refused, and starting a
   started service is harmless. For a mistyped name the server refuses that start too.
@@ -458,12 +465,10 @@ backoffs.
 - **`PATH.tmp` is overwritten and removed.** svcguard stages the new list in the saved list's
   path plus `.tmp`. It overwrites any file already there and deletes it when the run is refused
   or fails, even if svcguard did not make it.
-- **`--node` is a check, not a filter.** A valid partial `--node` still stops and starts the
-  services across every machine of the site, and only logs a warning about the machines it did
-  not name.
 - **The `--node` check puts the token in a URL.** It sends the short-lived admin token as a
   query parameter on one GET request, so it can appear in the access log of the server or any
-  proxy on the path. svcguard's own log and output never carry it.
+  proxy on the path. svcguard's own log and output never carry it. An `X-Esri-Authorization`
+  header would keep the token out of those logs, but this README has not verified that header.
 - **A redirected machine list is refused.** The machines GET carries the token in its query
   string, so svcguard follows no redirect there. A 301, 302 or 303 reply is an exit 1 refusal
   (assertion 233), and the token goes to no other host. Give the final URL.
@@ -492,9 +497,26 @@ backoffs.
   files can hold the account name of the person who ran the tool.
 - **Exit 1 has two causes.** It covers both a refusal on a finding (an unknown `--node`, a shrunk
   list, a service that never reached `STOPPED`) and a login or server that failed. Read the log
-  line before it.
+  line before it. Exit 1 means nothing ran and nothing needs restarting, but it does not say
+  whether the cause was the server or the request, so read the log.
 - **Ctrl-C is not turned into an exit code.** The `finally` block still starts the services,
   but the interrupt then leaves as a traceback, with an exit status outside the documented set.
+- **Two Esri behaviours are not verified against official documentation.** The `client` value
+  `requestip` in the token request ties the token to the caller's IP address, so a site reached
+  through changing NAT addresses may reject later calls. The claim that another program holding
+  the saved list open makes `os.replace` fail on Windows is also unverified; assertion 281
+  simulates the failure.
+- **Transport-error text is not scrubbed.** The message from a connection error is logged as the
+  operating system gave it, without the masking that reply bodies get. No input in the audits put
+  a token or password there, but nothing guarantees it.
+- **A permanent refusal while waiting for a state is retried.** A 401, 403 or 404 from the
+  status call inside the wait loop is logged and polled again until `--timeout` ends. The verdict
+  is not a false clean, but the run waits the full timeout.
+- **The 30 second HTTP timeout applies to each socket read, not to the whole reply,** and
+  svcguard does not cap the reply size. A server that sends one byte at a time, or an endless
+  body, can stall a run.
+- **The self-test may leave a `__pycache__` folder beside the script.** It reloads the file with
+  `importlib`. `.gitignore` covers it.
 - **A restart does not prove the data is current.** svcguard proves the services are up again.
   It does not prove that the rebuilt artifact matches its source. Usually you compare a
   last-edited timestamp, but a source layer without editor tracking has none. Checking derived

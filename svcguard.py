@@ -90,7 +90,14 @@ class SvcGuardError(Exception):
 
 
 class ServerRefused(SvcGuardError):
-    """The server answered and turned the request down, so it changed nothing."""
+    """The server answered and turned the request down, so it changed nothing.
+
+    code is the HTTP status or the code in the reply body, or None when the reply had none.
+    """
+
+    def __init__(self, message, code=None):
+        SvcGuardError.__init__(self, message)
+        self.code = code
 
 
 class TransientError(Exception):
@@ -252,7 +259,7 @@ def _http_json(url, data, insecure=False, http_timeout=HTTP_TIMEOUT, method="POS
         # service) is a permanent refusal. Retrying it only delays the page.
         if exc.code >= 500 or exc.code == 429:
             raise TransientError("HTTP %s from %s" % (exc.code, url))
-        raise ServerRefused("HTTP %s from %s (not retryable)" % (exc.code, url))
+        raise ServerRefused("HTTP %s from %s (not retryable)" % (exc.code, url), exc.code)
     except (ValueError, http.client.InvalidURL) as exc:
         # A URL urllib or http.client cannot use. No retry will fix it, and the message
         # can carry the request target, which holds the token on a GET.
@@ -278,11 +285,12 @@ def _check_ags(resp, what):
     if "error" in resp:
         err = resp["error"]
         code = err.get("code") if isinstance(err, dict) else None
-        raise ServerRefused("%s: server error code=%s body=%s" % (what, code, _safe(resp)))
+        raise ServerRefused("%s: server error code=%s body=%s" % (what, code, _safe(resp)), code)
     # Whitelist, not blacklist: AGS says "error" here, not "failed", and a future
     # endpoint could invent a third word. Anything that is not "success" is not.
     if "status" in resp and resp["status"] != "success":
-        raise ServerRefused("%s: status=%s body=%s" % (what, resp["status"], _safe(resp)))
+        raise ServerRefused("%s: status=%s body=%s" % (what, resp["status"], _safe(resp)),
+                            resp.get("code"))
     return resp
 
 
@@ -554,14 +562,19 @@ def exit_code(all_stopped, command_rc, failed_starts):
 def _needs_no_attention(server_url, service, token, insecure, retries):
     """After a failed start of a service whose stop was refused: is it safe to say so?
 
-    True when the status call says the service is STARTED or that the server has no
-    such service (a mistyped name). False when the service reads as anything else or
-    the status could not be read, because then the tool cannot tell it is up. Never raises.
+    True when the status call says the service is STARTED or answers 404 (HTTP or the
+    code in the body: the server has no such service, a mistyped name). False when the
+    service reads as anything else or the status could not be read, including every other
+    refusal (403, an invalid token, a server still starting), because then the tool cannot
+    tell it is up. Never raises.
     """
     try:
         state = get_service_state(server_url, service, token, insecure, retries)
-    except ServerRefused:
-        return True
+    except ServerRefused as exc:
+        if str(exc.code) == "404":
+            return True
+        log.error("%s: its state could not be read after the failed start: %s", service, exc)
+        return False
     except Exception as exc:
         log.error("%s: its state could not be read after the failed start: %s", service, exc)
         return False
@@ -1101,6 +1114,7 @@ class _StubAdmin(object):
         self.refuse_after_stop = False
         self.post_redirect = None
         self.cut_status = cut_status
+        self.status_reply = None
         self.ops = []
         self.forms = []
         self.gets = []
@@ -1127,9 +1141,10 @@ class _StubAdmin(object):
                     raw = b'{"configuredState": "STA'
                     declared = len(raw) + 40  # promise more bytes than are sent, then hang up
                 else:
+                    http_code, reply = reply if isinstance(reply, tuple) else (200, reply)
                     raw = (reply if isinstance(reply, str) else json.dumps(reply)).encode("utf-8")
                     declared = len(raw)
-                self.send_response(200)
+                self.send_response(200 if reply is stub.CUT else http_code)
                 self.send_header("Content-Length", str(declared))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -1175,6 +1190,8 @@ class _StubAdmin(object):
         if op == "status" and self.cut_status > 0:
             self.cut_status -= 1
             return self.CUT
+        if op == "status" and self.status_reply is not None:
+            return self.status_reply
         if op == "status" and service not in self.state:
             return {"error": {"code": 404, "message": "service not found"}}
         if op == "status":
@@ -2535,6 +2552,37 @@ def self_test():
             check(code == 3 and ran == [],
                   "a refused stop and a refused start with an unreadable status exit 3"
                   "  <-- pinned defect")
+
+            # The status call after a refused stop and a refused start must say 404 for
+            # exit 1. Any other refusal means the state was never read: exit 3.
+            for reply, what in (
+                    ((403, {"message": "Forbidden by upstream proxy"}), "an HTTP 403"),
+                    ((200, {"status": "error", "code": 498, "messages": ["Invalid token"]}),
+                     "an invalid-token body"),
+                    ((200, {"error": {"code": 500, "message": "server is starting up"}}),
+                     "a server-starting body"),
+                    ((200, {"status": "error"}), "an error body with no code")):
+                stub = _StubAdmin(["B.GeocodeServer"], refuse_stop=["B.GeocodeServer"],
+                                  fail_start=["B.GeocodeServer"])
+                stub.status_reply = reply
+                try:
+                    install(run=lambda cmd: ran.append(cmd) or 0)
+                    code = guard(stub.url, ["B.GeocodeServer"], "noop", "u", "p", False, 3, 20)
+                finally:
+                    stub.close()
+                check(code == 3 and ran == [],
+                      "a refused stop and a refused start with %s from status exit 3"
+                      "  <-- pinned defect" % what)
+            stub = _StubAdmin(["B.GeocodeServer"], refuse_stop=["B.GeocodeServer"],
+                              fail_start=["B.GeocodeServer"])
+            stub.status_reply = (404, {"message": "not found"})
+            try:
+                install(run=lambda cmd: ran.append(cmd) or 0)
+                code = guard(stub.url, ["B.GeocodeServer"], "noop", "u", "p", False, 3, 20)
+            finally:
+                stub.close()
+            check(code == 1 and ran == [],
+                  "a refused stop and a refused start with an HTTP 404 from status exit 1")
 
             # A 302 on a POST must not be followed: the second host answers the replayed
             # GET with JSON, and svcguard used to believe it.
