@@ -84,18 +84,19 @@ PASS 297  a refused stop and a refused start with an HTTP 403 from status exit 3
 PASS 302  a redirected POST is a refusal and no other host is contacted  <-- pinned defect
 PASS 303  with no stdin the user-name prompt reads as blank  <-- pinned defect
 PASS 304  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
-PASS 305  importing the file runs no main()
+PASS 305  Ctrl-C during the command still restarts the services, then propagates
+PASS 306  importing the file runs no main()
 ------------------------------------------------------------
-305 assertions, 0 failed
+306 assertions, 0 failed
 ```
 
-The full run prints all 305 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 306 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
 took 13 to 27 seconds on Windows with Python 3.9, 3.12 or 3.13, depending on load, and about 5 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 305 PASS lines.
+3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 306 PASS lines.
 
 ## Install
 
@@ -364,7 +365,7 @@ backoffs.
 - **A killed svcguard restarts nothing.** SIGTERM, SIGKILL, `TerminateProcess` and power loss
   skip the `finally` block. The guarantee covers a failing command, not a killed tool.
 - **A second interrupt abandons the starts that have not run.** Ctrl-C during the command is
-  covered (checked by a monkeypatched run, not by a self-test assertion; see below). A further Ctrl-C during the start phase is not caught.
+  covered (assertion 305, a command that raises `KeyboardInterrupt`; a real console Ctrl-C is unconfirmed, see below). A further Ctrl-C during the start phase is not caught.
 - **Exit 3 means "could not confirm".** A server that becomes unreachable during the command
   gives exit 3, although the services may be fine. Check the log before you restart anything.
 - **A start sent to a running service is assumed to succeed.** This happens after a stop that
@@ -395,7 +396,7 @@ backoffs.
   changes it at once. It proves the order of requests and what svcguard does with each answer.
   It does not prove how long a real site takes to stop a service.
 - **Coverage is 100 percent.** The self-test imports the file once under another module name
-  (assertion 305) to reach the false arc of `if __name__ == "__main__":`.
+  (assertion 306) to reach the false arc of `if __name__ == "__main__":`.
 - **The saved list can fail to update after a good run.** If the command ran but the saved list
   cannot be replaced, for example because another program holds the file open, svcguard logs an
   error and exits 4 instead of 0 (assertion 281), so a scheduler sees that the baseline is

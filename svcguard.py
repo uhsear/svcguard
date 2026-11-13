@@ -2627,6 +2627,19 @@ def self_test():
                   and "username and password are required" in child.stderr,
                   "a real run with no stdin and no user exits 64, not a traceback"
                   "  <-- pinned defect")
+
+            # ---- group T: Ctrl-C during the command still restarts ------------
+            def interrupted(command):
+                raise KeyboardInterrupt()
+            fake = _FakeServer(states=["STOPPED"])
+            try:
+                run_guard(fake, run=interrupted, timeout=20)
+            except KeyboardInterrupt:
+                interrupt_escaped = True
+            else:
+                interrupt_escaped = False
+            check(interrupt_escaped and fake.count("/stop") == 1 and fake.count("/start") == 1,
+                  "Ctrl-C during the command still restarts the services, then propagates")
         finally:
             getpass.getpass = real_getpass
             module.LOG_DIR = real_log_dir
