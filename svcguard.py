@@ -2659,11 +2659,21 @@ def self_test():
         log.propagate = True
 
     import importlib.util
-    spec = importlib.util.spec_from_file_location("svcguard_reload", os.path.abspath(__file__))
+    here = os.path.abspath(__file__)
+    cache = importlib.util.cache_from_source(here)
+    cache_before = os.path.getmtime(cache) if os.path.exists(cache) else None
+    spec = importlib.util.spec_from_file_location("svcguard_reload", here)
     reloaded = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(reloaded)
+    keep_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True  # only --apply may write; a .pyc beside the script is a write
+    try:
+        spec.loader.exec_module(reloaded)
+    finally:
+        sys.dont_write_bytecode = keep_bytecode
     check(reloaded.__name__ == "svcguard_reload" and reloaded.main is not main,
           "importing the file runs no main()")
+    check((os.path.getmtime(cache) if os.path.exists(cache) else None) == cache_before,
+          "the self-test writes no bytecode cache beside the script  <-- pinned defect")
     _close_logging()
 
     print("-" * 60)

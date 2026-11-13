@@ -86,17 +86,18 @@ PASS 303  with no stdin the user-name prompt reads as blank  <-- pinned defect
 PASS 304  a real run with no stdin and no user exits 64, not a traceback  <-- pinned defect
 PASS 305  Ctrl-C during the command still restarts the services, then propagates
 PASS 306  importing the file runs no main()
+PASS 307  the self-test writes no bytecode cache beside the script  <-- pinned defect
 ------------------------------------------------------------
-306 assertions, 0 failed
+307 assertions, 0 failed
 ```
 
-The full run prints all 306 assertions. Each `...` line above marks a cut. It needs no
+The full run prints all 307 assertions. Each `...` line above marks a cut. It needs no
 credentials, and its only network traffic goes to a stub server on `127.0.0.1`. The self-test
 sets `no_proxy` for that address, so a configured HTTP proxy cannot catch the stub traffic. It
 took 13 to 27 seconds on Windows with Python 3.9, 3.12 or 3.13, depending on load, and about 5 seconds on Linux with
 Python 3.12. Most of the Windows time is loopback HTTP: one refused connection alone took
 2 seconds there. Time it on an idle machine, because load stretches the Windows figure. Windows
-3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 306 PASS lines.
+3.9.25, 3.12.10 and 3.13, and Linux 3.9.25 and 3.12.3, print the same 307 PASS lines.
 
 ## Install
 
@@ -537,8 +538,6 @@ backoffs.
 - **The 30 second HTTP timeout applies to each socket read, not to the whole reply,** and
   svcguard does not cap the reply size. A server that sends one byte at a time, or an endless
   body, can stall a run.
-- **The self-test may leave a `__pycache__` folder beside the script.** It reloads the file with
-  `importlib`. `.gitignore` covers it.
 - **A restart does not prove the data is current.** svcguard proves the services are up again.
   It does not prove that the rebuilt artifact matches its source. Usually you compare a
   last-edited timestamp, but a source layer without editor tracking has none. Checking derived
